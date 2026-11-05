@@ -1,11 +1,11 @@
 // ==UserScript==
-// @name         Pixiv收藏夹自动标签
-// @name:en      Label Pixiv Bookmarks
-// @namespace    http://tampermonkey.net/
-// @version      5.18
-// @description  自动为Pixiv收藏夹内图片打上已有的标签，并可以搜索收藏夹
-// @description:en    Automatically add existing labels for images in the bookmarks, and users are able to search the bookmarks
-// @author       philimao
+// @name         Pixiv收藏夹自动标签（支持插画与小说）
+// @name:en      Label Pixiv Bookmarks (Artworks & Novels)
+// @namespace    https://github.com/Lorentz114514/LabelPixivBookmarks
+// @version      5.22
+// @description  自动为Pixiv收藏夹内图片与小说打上已有的标签，并可以搜索收藏夹
+// @description:en    Automatically add existing labels for images and novels in the bookmarks, and users are able to search the bookmarks
+// @author       philimao, Lorentz114514
 // @match        https://www.pixiv.net/*users/*
 // @icon         https://www.google.com/s2/favicons?domain=pixiv.net
 // @resource     bootstrapCSS https://cdn.jsdelivr.net/npm/bootstrap@5.2.0-beta1/dist/css/bootstrap.min.css
@@ -16,27 +16,32 @@
 // @grant        GM_setValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
+// @homepageURL  https://github.com/Lorentz114514/LabelPixivBookmarks
+// @supportURL   https://github.com/Lorentz114514/LabelPixivBookmarks/issues
+// @downloadURL  https://raw.githubusercontent.com/Lorentz114514/LabelPixivBookmarks/HEAD/index.js
+// @updateURL    https://raw.githubusercontent.com/Lorentz114514/LabelPixivBookmarks/HEAD/index.js
 // @license      MIT
 
 // ==/UserScript==
 
-const version = "5.18";
-const latest = `♢ 处理Pixiv组件类名更新
-♢ Update constants due to change of element class names
-♢ 并非所有功能都已恢复，仅验证了设置标签功能
-♢ Note that not all functions have been restored. Only labeling function has been validated.`;
+const version = "5.22";
+const latest = `♢ 适配Pixiv新版UI选择器与React节点结构，恢复全部功能
+♢ Updated selectors and React Fiber/API fallbacks for new Pixiv UI
+♢ 新增对收藏夹【小说 (Novels)】的完整支持（自动打标签、搜索、管理标签、跨类型共享标签等）
+♢ Added full support for bookmarked Novels (auto-labeling, search, tag management, cross-type tag sharing)`;
 
 let uid,
   token,
   lang,
   userTags,
   userTagDict,
+  otherTypeUserTags = [],
   synonymDict,
   pageInfo,
   theme,
   showWorkTags,
   generator,
-  // workType,
+  workType = "illusts", // "illusts" | "novels"
   feature,
   turboMode,
   cachedBookmarks = {},
@@ -50,26 +55,229 @@ let unsafeWindow_ = unsafeWindow,
   GM_registerMenuCommand_ = GM_registerMenuCommand;
 
 // selectors
-const BANNER = ".sc-8bf48ebe-0";
+const BANNER = ".bg-surface1 > div:first-child";
+const NAV = ".bg-surface1 nav";
 const THEME_CONTAINER = "html";
-const WORK_SECTION = "section.sc-3d8ed48f-0"; // 作品section，从works->pagination
-const WORK_CONTAINER = "ul.sc-7d21cb21-1.jELUak"; // 仅包含作品
-const PAGE_BODY = ".sc-2b45994f-0.cUskQy"; // 自主页、收藏起下方
-const EDIT_BUTTON_CONTAINER = ".sc-9d335d39-6.cfUrtF"; // 管理收藏按钮父容器，包含左侧作品文字
-const REMOVE_BOOKMARK_CONTAINER = ".sc-231887f1-4.kvBpUA";
-const WORK_NUM = ".sc-b5e6ab10-0.hfQbJx";
-const ADD_TAGS_MODAL_ENTRY = ".bbTNLI"; // 原生添加标签窗口中标签按钮
-const ALL_TAGS_BUTTON = ".jkGZFM"; // 标签切换窗口触发按钮
-const ALL_TAGS_CONTAINER = ".hpRxDJ"; // 标签按钮容器
-const ALL_TAGS_MODAL = ".ggMyQW"; // 原生标签切换窗口
-const ALL_TAGS_MODAL_CONTAINER = ".gOPhqx"; // 原生标签切换窗口中标签按钮容器
+const WORK_SECTION = "section"; // 作品section，从works->pagination
+const WORK_CONTAINER = "section ul"; // 仅包含作品
+const PAGE_BODY = '#__next [data-overlay-container="true"] > div:first-child'; // 自主页、收藏起下方
+const EDIT_BUTTON_CONTAINER = "section > div:first-child"; // 管理收藏按钮父容器，包含左侧作品文字
+const REMOVE_BOOKMARK_CONTAINER =
+  "section > div:nth-child(2) > div > div:first-child";
+const WORK_NUM = "section h2 + div";
+const ADD_TAGS_MODAL_ENTRY = 'ul[role="listbox"] button, ul li button'; // 原生添加标签窗口中标签按钮
+const ALL_TAGS_BUTTON =
+  "section > div:nth-child(2) > div:first-child > div:last-child"; // 标签切换窗口触发按钮
+const ALL_TAGS_CONTAINER = "section > div:nth-child(2) > div:first-child"; // 标签按钮容器
+const ALL_TAGS_MODAL = '[role="dialog"]:not(.modal)'; // 原生标签切换窗口
+const ALL_TAGS_MODAL_CONTAINER = '[role="dialog"]:not(.modal) > div'; // 原生标签切换窗口中标签按钮容器
+const CURRENT_PAGE_SIZE = 48;
+
+function detectWorkTypeFromUrl(urlStr = window.location.href) {
+  try {
+    const u = new URL(urlStr, window.location.origin);
+    if (/\/bookmarks\/novels(\/|$|\?)/.test(u.pathname) || /\/novels(\/|$|\?)/.test(u.pathname)) {
+      return "novels";
+    }
+  } catch (_) {
+    if (urlStr.includes("/bookmarks/novels") || urlStr.includes("/novels")) {
+      return "novels";
+    }
+  }
+  return "illusts";
+}
+
+function getPageWorkSegment(type = workType) {
+  return type === "novels" ? "novels" : "artworks";
+}
+
+function isNovelWork(work, type = workType) {
+  if (work && (work.textCount !== undefined || work.wordCount !== undefined || work.readingTime !== undefined)) {
+    return true;
+  }
+  if (work && (work.illustType !== undefined || work.pageCount !== undefined)) {
+    return false;
+  }
+  return type === "novels";
+}
+
+function getWorkUrl(workOrId, type = workType, full = false) {
+  const isNovel = typeof workOrId === "object" ? isNovelWork(workOrId, type) : type === "novels";
+  const id = typeof workOrId === "object" ? workOrId.id : workOrId;
+  const path = isNovel ? `/novel/show.php?id=${id}` : `/artworks/${id}`;
+  return full ? `https://www.pixiv.net${path}` : path;
+}
+
+function getWorkAlt(work) {
+  if (!work) return "";
+  if (work.alt) return work.alt;
+  const tagsPart =
+    Array.isArray(work.tags) && work.tags.length
+      ? work.tags
+          .slice(0, 3)
+          .map((t) => `#${t}`)
+          .join(" ") + " "
+      : "";
+  return `${tagsPart}${work.title || ""} - ${work.userName || ""}`.trim();
+}
+
+function getBookmarksPageUrl(targetUid = uid, type = workType, tag = "", rest = "") {
+  const seg = getPageWorkSegment(type);
+  const tagPart = tag ? `/${encodeURIComponent(tag)}` : "";
+  const restPart = rest ? `?rest=${rest}` : "";
+  return `https://www.pixiv.net/users/${targetUid}/bookmarks/${seg}${tagPart}${restPart}`;
+}
+
+function getReactFiber(el) {
+  if (!el) return null;
+  const key = Object.keys(el).find(
+    (k) =>
+      k.startsWith("__reactFiber$") ||
+      k.startsWith("__reactInternalInstance$"),
+  );
+  return key ? el[key] : null;
+}
+
+function getReactProps(el) {
+  if (!el) return null;
+  const key = Object.keys(el).find((k) => k.startsWith("__reactProps$"));
+  if (key && el[key]) return el[key];
+  return getReactFiber(el)?.memoizedProps || null;
+}
+
+function findInReactTree(root, predicate, maxDepth = 12) {
+  if (!root) return null;
+  const seen = new Set();
+  const queue = [{ node: root, depth: 0 }];
+  while (queue.length) {
+    const { node, depth } = queue.shift();
+    if (!node || typeof node !== "object" || seen.has(node)) continue;
+    seen.add(node);
+    try {
+      if (predicate(node)) return node;
+    } catch (_) {
+      // ignore predicate errors
+    }
+    if (depth >= maxDepth) continue;
+    const candidates = [
+      node.memoizedProps,
+      node.pendingProps,
+      node.props,
+      node.child,
+      node.sibling,
+      node.return,
+      ...(Array.isArray(node.children) ? node.children : []),
+      ...(Array.isArray(node.memoizedProps?.children)
+        ? node.memoizedProps.children
+        : []),
+    ];
+    for (const c of candidates) {
+      if (c && typeof c === "object" && !seen.has(c)) {
+        queue.push({ node: c, depth: depth + 1 });
+      }
+    }
+  }
+  return null;
+}
+
+function getBookmarkPageState() {
+  const url = new URL(window.location.href);
+  const userId = url.pathname.match(/\/users\/(\d+)/)?.[1] || uid || "";
+  const detectedType = detectWorkTypeFromUrl(url.href);
+  const isBookmarkPage = /\/users\/\d+\/bookmarks\/(?:artworks|novels)/.test(
+    url.pathname,
+  );
+  const tagMatch = decodeURIComponent(url.pathname).match(
+    /\/bookmarks\/(?:artworks|novels)\/?([^/?#]*)/,
+  );
+  const rawTag = tagMatch?.[1] || "";
+  const tag = rawTag === "index.html" ? "" : rawTag;
+  const page = parseInt(url.searchParams.get("p") || "1", 10) || 1;
+  const publicationType =
+    url.searchParams.get("rest") === "hide" ? "hide" : "show";
+  return {
+    userId: userId ? userId.toString() : "",
+    isBookmarkPage,
+    workType: detectedType,
+    pageWorkSegment: getPageWorkSegment(detectedType),
+    tag,
+    page,
+    publicationType,
+    restrict: publicationType === "hide",
+    offset: (page - 1) * CURRENT_PAGE_SIZE,
+  };
+}
+
+function getClientInfoFromGlobals() {
+  const context = unsafeWindow_?.pixiv?.context || {};
+  const user = context.user || unsafeWindow_?.pixiv?.user || {};
+  const dataLayer = unsafeWindow_?.dataLayer?.[0] || {};
+  let nextToken = null,
+    nextUid = null,
+    nextLang = null;
+  try {
+    const nextDataEl = document.getElementById("__NEXT_DATA__");
+    if (nextDataEl) {
+      const text = nextDataEl.textContent || "";
+      nextToken = text.match(/"token"\s*:\s*"([a-f0-9]{32})"/)?.[1] || null;
+      nextUid = text.match(/"userId"\s*:\s*"(\d+)"/)?.[1] || null;
+      nextLang = text.match(/"lang"\s*:\s*"([a-zA-Z_-]+)"/)?.[1] || null;
+    }
+  } catch (_) {
+    // ignore
+  }
+  return {
+    uid: (
+      dataLayer.user_id ||
+      user.id ||
+      context.userId ||
+      nextUid ||
+      uid ||
+      ""
+    ).toString(),
+    lang:
+      dataLayer.lang ||
+      context.lang ||
+      nextLang ||
+      document.documentElement.lang ||
+      navigator.language ||
+      "zh",
+    token:
+      context.token ||
+      unsafeWindow_?.pixiv?.token ||
+      document.querySelector("meta[name='csrf-token']")?.content ||
+      nextToken ||
+      token,
+  };
+}
+
+function findProfileNav() {
+  return (
+    document.querySelector(NAV) ||
+    [...document.querySelectorAll("nav")].find(
+      (n) =>
+        n.querySelector('a[href*="/bookmarks"]') ||
+        n.querySelector('a[href*="/artworks"]') ||
+        n.querySelector('a[href*="/novels"]'),
+    ) ||
+    document.querySelector("nav")
+  );
+}
 
 function getCharacterName(tag) {
-  return tag.split("(")[0];
+  return String(tag)
+    .replace(/（/g, "(")
+    .replace(/）/g, ")")
+    .split("(")[0]
+    .trim();
 }
 
 function getWorkTitle(tag) {
-  return (tag.split("(")[1] || "").split(")")[0];
+  return (
+    String(tag).replace(/（/g, "(").replace(/）/g, ")").split("(")[1] || ""
+  )
+    .split(")")[0]
+    .trim();
 }
 
 function stringIncludes(s1, s2) {
@@ -82,18 +290,17 @@ function stringIncludes(s1, s2) {
 function arrayIncludes(array, element, func1, func2, fuzzy) {
   if (!Array.isArray(array))
     throw new TypeError("First argument is not an array");
-  let array1 = func1 ? array.map(func1) : array;
-  let array2 = Array.isArray(element) ? element : [element];
-  array2 = func2 ? array2.map(func2) : array2;
-  const el = [...array1, ...array2].find((i) => !i.toUpperCase);
-  if (el) {
-    console.log(el, array, element);
-    throw new TypeError(
-      `Element ${el.toString()} does not have method toUpperCase`,
-    );
-  }
-  array1 = array1.map((i) => i.toUpperCase());
-  array2 = array2.map((i) => i.toUpperCase());
+  let array1 = array
+    .filter((i) => i !== undefined && i !== null)
+    .map((i) => String(i));
+  array1 = (func1 ? array1.map(func1) : array1).filter((i) => i !== "");
+  let array2 = (Array.isArray(element) ? element : [element])
+    .filter((i) => i !== undefined && i !== null)
+    .map((i) => String(i));
+  array2 = (func2 ? array2.map(func2) : array2).filter((i) => i !== "");
+  if (!array1.length || !array2.length) return false;
+  array1 = array1.map((i) => String(i).toUpperCase());
+  array2 = array2.map((i) => String(i).toUpperCase());
   if (fuzzy)
     return array2.every((i2) => array1.some((i1) => stringIncludes(i1, i2)));
   else return array2.every((i) => array1.includes(i));
@@ -253,11 +460,18 @@ function loadResources() {
 }
 
 const bookmarkBatchSize = 100;
-async function fetchBookmarks(uid, tagToQuery, offset, publicationType) {
+async function fetchBookmarks(
+  uid,
+  tagToQuery,
+  offset,
+  publicationType,
+  limit = bookmarkBatchSize,
+  targetWorkType = workType,
+) {
   const bookmarksRaw = await fetch(
     `/ajax/user/${uid}` +
-      `/illusts/bookmarks?tag=${tagToQuery}` +
-      `&offset=${offset}&limit=${bookmarkBatchSize}&rest=${publicationType}`,
+      `/${targetWorkType}/bookmarks?tag=${encodeURIComponent(tagToQuery || "")}` +
+      `&offset=${offset}&limit=${limit}&rest=${publicationType}&lang=${lang}`,
   );
   if (!turboMode) await delay(500);
   const bookmarksRes = await bookmarksRaw.json();
@@ -274,6 +488,7 @@ async function fetchAllBookmarksByTag(
   publicationType,
   progressBar,
   max = 100,
+  targetWorkType = workType,
 ) {
   let total = 65535,
     offset = 0,
@@ -286,18 +501,27 @@ async function fetchAllBookmarksByTag(
         const batchSize = 10;
         for (let i = 0; i < batchSize && offset < total; i++) {
           bookmarksBatch.push(
-            fetchBookmarks(uid, tag, offset, publicationType),
+            fetchBookmarks(
+              uid,
+              tag,
+              offset,
+              publicationType,
+              bookmarkBatchSize,
+              targetWorkType,
+            ),
           );
           offset += max;
         }
         const batchResults = await Promise.all(bookmarksBatch);
         for (const bookmarks of batchResults) {
+          if (!bookmarks) continue;
           total = bookmarks.total;
-          for (const work of bookmarks["works"]) {
+          for (const work of bookmarks["works"] || []) {
+            const bmId = work["bookmarkData"]?.["id"];
             const fetchedWork = {
               ...work,
               associatedTags:
-                bookmarks["bookmarkTags"][work["bookmarkData"]["id"]] || [],
+                (bmId && bookmarks["bookmarkTags"]?.[bmId]) || [],
             };
             totalWorks.push(fetchedWork);
             fetchPromises.push(fetchedWork);
@@ -311,20 +535,23 @@ async function fetchAllBookmarksByTag(
           tag,
           offset,
           publicationType,
+          bookmarkBatchSize,
+          targetWorkType,
         );
+        if (!bookmarks) break;
         total = bookmarks.total;
-        const works = bookmarks["works"];
-        works.forEach(
-          (w) =>
-            (w.associatedTags =
-              bookmarks["bookmarkTags"][w["bookmarkData"]["id"]] || []),
-        );
+        const works = bookmarks["works"] || [];
+        works.forEach((w) => {
+          const bmId = w["bookmarkData"]?.["id"];
+          w.associatedTags = (bmId && bookmarks["bookmarkTags"]?.[bmId]) || [];
+        });
         totalWorks.push(...works);
         offset = totalWorks.length;
+        if (!works.length) break;
       }
       if (progressBar) {
         progressBar.innerText = totalWorks.length + "/" + total;
-        const ratio = ((totalWorks.length / total) * max).toFixed(2);
+        const ratio = ((totalWorks.length / (total || 1)) * max).toFixed(2);
         progressBar.style.width = ratio + "%";
       }
     }
@@ -342,15 +569,21 @@ async function fetchAllBookmarksByTag(
   return totalWorks;
 }
 
-async function addBookmark(illust_id, restrict, tags) {
-  const resRaw = await fetch("/ajax/illusts/bookmarks/add", {
+async function addBookmark(
+  work_id,
+  restrict,
+  tags,
+  targetWorkType = workType,
+) {
+  const idKey = targetWorkType === "novels" ? "novel_id" : "illust_id";
+  const resRaw = await fetch(`/ajax/${targetWorkType}/bookmarks/add`, {
     headers: {
       accept: "application/json",
       "content-type": "application/json; charset=utf-8",
       "x-csrf-token": token,
     },
     body: JSON.stringify({
-      illust_id,
+      [idKey]: work_id,
       restrict,
       comment: "",
       tags,
@@ -361,9 +594,13 @@ async function addBookmark(illust_id, restrict, tags) {
   return resRaw;
 }
 
-async function removeBookmark(bookmarkIds, progressBar) {
+async function removeBookmark(
+  bookmarkIds,
+  progressBar,
+  targetWorkType = workType,
+) {
   async function run(ids) {
-    await fetch("/ajax/illusts/bookmarks/remove", {
+    await fetch(`/ajax/${targetWorkType}/bookmarks/remove`, {
       headers: {
         accept: "application/json",
         "content-type": "application/json; charset=utf-8",
@@ -399,6 +636,7 @@ async function updateBookmarkTags(
   addTags,
   removeTags,
   progressBar,
+  targetWorkType = workType,
 ) {
   if (!bookmarkIds?.length)
     throw new TypeError("BookmarkIds is undefined or empty array");
@@ -423,7 +661,7 @@ async function updateBookmarkTags(
         const addTagsChunks = chunkArray(addTags, bookmarkBatchSize);
         for (const tagsChunk of addTagsChunks) {
           requests.push(
-            fetchRequest("/ajax/illusts/bookmarks/add_tags", {
+            fetchRequest(`/ajax/${targetWorkType}/bookmarks/add_tags`, {
               tags: tagsChunk,
               bookmarkIds: ids,
             }),
@@ -434,25 +672,25 @@ async function updateBookmarkTags(
         const removeTagsChunks = chunkArray(removeTags, bookmarkBatchSize);
         for (const tagsChunk of removeTagsChunks) {
           requests.push(
-            fetchRequest("/ajax/illusts/bookmarks/remove_tags", {
+            fetchRequest(`/ajax/${targetWorkType}/bookmarks/remove_tags`, {
               removeTags: tagsChunk,
               bookmarkIds: ids,
             }),
           );
         }
       }
-      if (requests.length > 1) await Promise.all(requests);
+      if (requests.length) await Promise.all(requests);
       await delay(500);
     } else {
       if (addTags && addTags.length) {
-        await fetchRequest("/ajax/illusts/bookmarks/add_tags", {
+        await fetchRequest(`/ajax/${targetWorkType}/bookmarks/add_tags`, {
           tags: addTags,
           bookmarkIds: ids,
         });
         await delay(500);
       }
       if (removeTags && removeTags.length) {
-        await fetchRequest("/ajax/illusts/bookmarks/remove_tags", {
+        await fetchRequest(`/ajax/${targetWorkType}/bookmarks/remove_tags`, {
           removeTags,
           bookmarkIds: ids,
         });
@@ -483,13 +721,14 @@ async function updateBookmarkRestrict(
   bookmarkIds,
   bookmarkRestrict,
   progressBar,
+  targetWorkType = workType,
 ) {
   if (!bookmarkIds?.length)
     throw new TypeError("BookmarkIds is undefined or empty array");
   if (!["public", "private"].includes(bookmarkRestrict))
     throw new TypeError("Bookmark restrict should be public or private");
   async function run(ids) {
-    await fetch("/ajax/illusts/bookmarks/edit_restrict", {
+    await fetch(`/ajax/${targetWorkType}/bookmarks/edit_restrict`, {
       headers: {
         accept: "application/json",
         "content-type": "application/json; charset=utf-8",
@@ -545,7 +784,7 @@ async function clearBookmarkTags(works) {
   const progressBar = document.querySelector("#progress_modal_progress_bar");
 
   const tagPool = Array.from(
-    new Set(works.reduce((a, b) => [...a, ...b.associatedTags], [])),
+    new Set(works.reduce((a, b) => [...a, ...(b.associatedTags || [])], [])),
   );
   const workLength = works.length;
   const tagPoolSize = tagPool.length;
@@ -556,8 +795,9 @@ async function clearBookmarkTags(works) {
       if (!window.runFlag) break;
       const tag = tagPool[index - 1];
       const ids = works
-        .filter((w) => w.associatedTags.includes(tag))
-        .map((w) => w.bookmarkId || w["bookmarkData"]["id"]);
+        .filter((w) => (w.associatedTags || []).includes(tag))
+        .map((w) => w.bookmarkId || w["bookmarkData"]?.["id"])
+        .filter(Boolean);
       if (DEBUG) console.log("Clearing", tag, ids);
 
       progressBar.innerText = index + "/" + tagPoolSize;
@@ -565,26 +805,26 @@ async function clearBookmarkTags(works) {
       progressBar.style.width = ratio + "%";
       prompt.innerText = `正在清除标签... / Clearing bookmark tags`;
 
-      await updateBookmarkTags(ids, null, [tag]);
+      if (ids.length) await updateBookmarkTags(ids, null, [tag]);
     }
   } else {
     for (let index = 1; index <= workLength; index++) {
       if (!window.runFlag) break;
       const work = works[index - 1];
-      const url = "https://www.pixiv.net/artworks/" + work.id;
+      const url = getWorkUrl(work, workType, true);
       console.log(index, work.title, work.id, url);
       if (DEBUG) console.log(work);
 
       progressBar.innerText = index + "/" + workLength;
       const ratio = ((index / workLength) * 100).toFixed(2);
       progressBar.style.width = ratio + "%";
-      prompt.innerText = work.alt + "\n" + work.associatedTags.join(" ");
+      prompt.innerText =
+        getWorkAlt(work) + "\n" + (work.associatedTags || []).join(" ");
 
-      await updateBookmarkTags(
-        [work.bookmarkId || work["bookmarkData"]["id"]],
-        undefined,
-        work.associatedTags,
-      );
+      const bmId = work.bookmarkId || work["bookmarkData"]?.["id"];
+      if (bmId && work.associatedTags?.length) {
+        await updateBookmarkTags([bmId], undefined, work.associatedTags);
+      }
     }
   }
 
@@ -600,24 +840,121 @@ async function clearBookmarkTags(works) {
 
 async function handleClearBookmarkTags(evt) {
   evt.preventDefault();
-  const selected = [
-    ...document.querySelectorAll("label>div[aria-disabled='true']"),
-  ];
-  if (!selected.length) return;
+  if (
+    evt.currentTarget &&
+    evt.currentTarget.getAttribute("aria-disabled") === "true"
+  ) {
+    return;
+  }
 
-  const works = selected
-    .map((el) => {
-      const middleChild = Object.values(
-        el.parentNode.parentNode.parentNode.parentNode,
-      )[0]["child"];
-      const work = middleChild["memoizedProps"]["work"];
-      work.associatedTags =
-        middleChild["child"]["memoizedProps"]["associatedTags"] || [];
-      work.bookmarkId = middleChild["memoizedProps"]["bookmarkId"];
-      return work;
-    })
-    .filter((work) => work.associatedTags.length);
-  await clearBookmarkTags(works);
+  const workInfo = await updateWorkInfo(true).catch(() => ({}));
+  const infoWorks = workInfo?.works || [];
+  const allLis = [...document.querySelectorAll(`${WORK_CONTAINER} li`)];
+  const selectedWorks = [];
+
+  if (allLis.length) {
+    allLis.forEach((li, idx) => {
+      const isChecked =
+        li.querySelector('input[type="checkbox"]:checked') ||
+        li.querySelector("label > div[aria-disabled='true']");
+      if (!isChecked) return;
+
+      let work = null;
+      let associatedTags = null;
+      let bookmarkId = null;
+
+      // Try extracting from React Fiber on li or checkbox
+      const fiber = getReactFiber(isChecked) || getReactFiber(li);
+      if (fiber) {
+        let node = fiber;
+        for (let i = 0; i < 18 && node; i++) {
+          const mp = node.memoizedProps;
+          if (mp?.work && typeof mp.work === "object") {
+            work = { ...mp.work };
+            bookmarkId =
+              mp.bookmarkId || mp.work?.bookmarkData?.id || bookmarkId;
+            if (Array.isArray(mp.work.associatedTags) && mp.work.associatedTags.length) {
+              associatedTags = mp.work.associatedTags;
+            } else if (Array.isArray(mp.tagList) && mp.tagList.length) {
+              associatedTags = mp.tagList;
+            } else if (Array.isArray(mp.associatedTags) && mp.associatedTags.length) {
+              associatedTags = mp.associatedTags;
+            }
+            break;
+          }
+          node = node.return;
+        }
+        if (!associatedTags) {
+          const tagNode = findInReactTree(
+            getReactFiber(li),
+            (n) =>
+              Array.isArray(n?.memoizedProps?.associatedTags) ||
+              Array.isArray(n?.memoizedProps?.tagList),
+            10,
+          );
+          if (tagNode?.memoizedProps) {
+            associatedTags =
+              tagNode.memoizedProps.associatedTags ||
+              tagNode.memoizedProps.tagList;
+          }
+        }
+      }
+
+      // Fallback / merge with workInfo.works[idx]
+      const fallbackWork = infoWorks[idx];
+      if (!work && fallbackWork) {
+        work = { ...fallbackWork };
+      }
+      if (work) {
+        work.bookmarkId =
+          bookmarkId ||
+          work.bookmarkId ||
+          work.bookmarkData?.id ||
+          fallbackWork?.bookmarkData?.id;
+        work.associatedTags =
+          (Array.isArray(associatedTags) && associatedTags.length
+            ? associatedTags
+            : null) ||
+          (Array.isArray(work.associatedTags) && work.associatedTags.length
+            ? work.associatedTags
+            : null) ||
+          fallbackWork?.associatedTags ||
+          [];
+        selectedWorks.push(work);
+      }
+    });
+  } else {
+    const selected = [
+      ...document.querySelectorAll(
+        'input[type="checkbox"]:checked, label:has(input:checked) > div[aria-disabled], label > div[aria-disabled="true"]',
+      ),
+    ];
+    selected.forEach((el) => {
+      let node = getReactFiber(el);
+      for (let i = 0; i < 18 && node; i++) {
+        if (node?.memoizedProps?.work) break;
+        node = node.return;
+      }
+      if (node?.memoizedProps?.work) {
+        const work = { ...node.memoizedProps.work };
+        work.associatedTags =
+          work.associatedTags?.length
+            ? work.associatedTags
+            : node.memoizedProps.tagList ||
+              node.memoizedProps.associatedTags ||
+              [];
+        work.bookmarkId =
+          node.memoizedProps.bookmarkId || work.bookmarkData?.id;
+        selectedWorks.push(work);
+      }
+    });
+  }
+
+  const worksToClear = selectedWorks.filter(
+    (work) => work && Array.isArray(work.associatedTags) && work.associatedTags.length,
+  );
+  if (!selectedWorks.length) return;
+  await clearBookmarkTags(worksToClear);
 }
 
 async function deleteTag(tag, publicationType) {
@@ -661,8 +998,10 @@ async function deleteTag(tag, publicationType) {
     return;
   }
 
-  const ids = totalBookmarks.map((work) => work["bookmarkData"]["id"]);
-  await updateBookmarkTags(ids, undefined, [tag]);
+  const ids = totalBookmarks
+    .map((work) => work["bookmarkData"]?.["id"])
+    .filter(Boolean);
+  if (ids.length) await updateBookmarkTags(ids, undefined, [tag]);
 
   progressBar.style.width = "100%";
   if (window.runFlag)
@@ -673,7 +1012,12 @@ async function deleteTag(tag, publicationType) {
   setTimeout(() => {
     instance.hide();
     if (window.runFlag && !DEBUG)
-      window.location.href = `https://www.pixiv.net/users/${uid}/bookmarks/artworks?rest=${publicationType}`;
+      window.location.href = getBookmarksPageUrl(
+        uid,
+        workType,
+        "",
+        publicationType,
+      );
   }, 1000);
 }
 
@@ -686,17 +1030,23 @@ async function handleDeleteTag(evt) {
 async function handleLabel(evt) {
   evt.preventDefault();
 
+  const targetWorkType =
+    document.querySelector("#label_work_type")?.value || workType;
   const addFirst = document.querySelector("#label_add_first").value;
   const addAllTags = document.querySelector("#label_add_all_tags").value;
   const tagToQuery = document.querySelector("#label_tag_query").value;
-  const publicationType = (await updateWorkInfo())["restrict"]
-    ? "hide"
-    : "show";
+  const publicationSelect = document.querySelector("#label_publication")?.value;
+  const publicationType =
+    publicationSelect ||
+    ((await updateWorkInfo())["restrict"] ? "hide" : "show");
   const labelR18 = document.querySelector("#label_r18").value;
   const labelSafe = document.querySelector("#label_safe").value;
   const labelAI = document.querySelector("#label_ai").value;
   const labelAuthor = document.querySelector("#label_author").value;
-  const labelStrict = document.querySelector("#label_strict").value;
+  const labelStrict =
+    document.querySelector("#label_strict").value === "true";
+  const shareTags =
+    (document.querySelector("#label_share_tags")?.value ?? "true") === "true";
   const exclusion = document
     .querySelector("#label_exclusion")
     .value.split(/[\s\n]/)
@@ -704,13 +1054,13 @@ async function handleLabel(evt) {
 
   console.log("Label Configuration:");
   console.log(
-    `addFirst: ${addFirst === "true"}; addAllTags: ${
+    `workType: ${targetWorkType}; addFirst: ${addFirst === "true"}; addAllTags: ${
       addAllTags === "true"
     }; tagToQuery: ${tagToQuery}; labelR18: ${
       labelR18 === "true"
     }; labelSafe: ${labelSafe}; labelAI: ${labelAI}; labelAuthor: ${
       labelAuthor === "true"
-    }; publicationType: ${publicationType}; exclusion: ${exclusion.join(",")}`,
+    }; shareTags: ${shareTags}; publicationType: ${publicationType}; exclusion: ${exclusion.join(",")}`,
   );
 
   if (
@@ -727,10 +1077,20 @@ All tags that come with the work will be first added to your user tags, which ca
   const objDiv = document.querySelector("#label_form");
   objDiv.scrollTop = objDiv.scrollHeight;
 
+  // Build effective user tag pool (optionally merging tags from both Artworks and Novels)
+  const effectiveUserTags = Array.from(
+    new Set([
+      ...(userTags || []),
+      ...(shareTags && Array.isArray(otherTypeUserTags)
+        ? otherTypeUserTags
+        : []),
+    ]),
+  );
+
   // fetch bookmarks
   let total, // total bookmarks of specific tag
     index = 0, // counter of do-while loop
-    offset = 0; // as uncategorized ones will decrease, offset means num of images updated "successfully"
+    offset = 0; // as uncategorized ones will decrease, offset means num of works updated "successfully"
   // update progress bar
   const progressBar = document.querySelector("#progress_bar");
   progressBar.style.width = "0";
@@ -752,19 +1112,24 @@ All tags that come with the work will be first added to your user tags, which ca
       tagToQuery,
       realOffset,
       publicationType,
+      bookmarkBatchSize,
+      targetWorkType,
     );
+    if (!bookmarks) break;
     if (DEBUG) console.log("Bookmarks", bookmarks);
-    if (!total) total = bookmarks.total;
-    for (let work of bookmarks["works"]) {
-      const url = "https://www.pixiv.net/artworks/" + work.id;
+    if (total === undefined) total = bookmarks.total;
+    const worksList = bookmarks["works"] || [];
+    if (!worksList.length) break;
+    for (let work of worksList) {
+      const url = getWorkUrl(work, targetWorkType, true);
       if (DEBUG) console.log(index, work.title, work.id, url);
       index++;
       // ---- means unavailable, hidden or deleted by author
-      if (work.title === "-----") {
+      if (work.title === "-----" || work.isMasked === true || !work["bookmarkData"]?.["id"]) {
         offset++;
         continue;
       }
-      const workTags = work["tags"];
+      const workTags = Array.isArray(work["tags"]) ? [...work["tags"]] : [];
       let intersection = [];
       // add all work tags, and replace those which are defined in synonym dict
       if (addAllTags === "true")
@@ -774,32 +1139,37 @@ All tags that come with the work will be first added to your user tags, which ca
               synonymDict[userTag].includes(workTag),
             ) || workTag,
         );
-      if (labelAuthor === "true")
-        workTags.push(work["userName"], work["userId"]);
+      if (labelAuthor === "true") {
+        if (work["userName"]) workTags.push(String(work["userName"]));
+        if (work["userId"] !== undefined && work["userId"] !== null)
+          workTags.push(String(work["userId"]));
+      }
       intersection = intersection.concat(
-        [...userTags, ...Object.keys(synonymDict)].filter((userTag) => {
-          // if work tags includes this user tag
-          if (
-            arrayIncludes(workTags, userTag) || // full tag
-            arrayIncludes(workTags, userTag, getWorkTitle) || // work title
-            (arrayIncludes(workTags, userTag, null, getCharacterName) && // char name
-              (!labelStrict ||
-                arrayIncludes(workTags, userTag, null, getWorkTitle))) // not strict or includes work title
-          )
-            return true;
-          // if work tags match a user alias (exact match)
-          return (
-            synonymDict[userTag] &&
-            synonymDict[userTag].find(
-              (alias) =>
-                arrayIncludes(workTags, alias) ||
-                arrayIncludes(workTags, alias, getWorkTitle) || // work title
-                (arrayIncludes(workTags, alias, null, getCharacterName) &&
-                  (!labelStrict ||
-                    arrayIncludes(workTags, alias, null, getWorkTitle))),
+        [...effectiveUserTags, ...Object.keys(synonymDict)].filter(
+          (userTag) => {
+            // if work tags includes this user tag
+            if (
+              arrayIncludes(workTags, userTag) || // full tag
+              arrayIncludes(workTags, userTag, getWorkTitle) || // work title
+              (arrayIncludes(workTags, userTag, null, getCharacterName) && // char name
+                (!labelStrict ||
+                  arrayIncludes(workTags, userTag, null, getWorkTitle))) // not strict or includes work title
             )
-          );
-        }),
+              return true;
+            // if work tags match a user alias (exact match)
+            return (
+              synonymDict[userTag] &&
+              synonymDict[userTag].find(
+                (alias) =>
+                  arrayIncludes(workTags, alias) ||
+                  arrayIncludes(workTags, alias, getWorkTitle) || // work title
+                  (arrayIncludes(workTags, alias, null, getCharacterName) &&
+                    (!labelStrict ||
+                      arrayIncludes(workTags, alias, null, getWorkTitle))),
+              )
+            );
+          },
+        ),
       );
       // if workTags match some alias, add it to the intersection (exact match, with or without work title)
       intersection = intersection.concat(
@@ -837,7 +1207,7 @@ All tags that come with the work will be first added to your user tags, which ca
       );
 
       const bookmarkId = work["bookmarkData"]["id"];
-      const prevTags = bookmarks["bookmarkTags"][bookmarkId] || [];
+      const prevTags = bookmarks["bookmarkTags"]?.[bookmarkId] || [];
 
       if (!intersection.length && !prevTags.length) {
         if (addFirst === "true") {
@@ -852,6 +1222,7 @@ All tags that come with the work will be first added to your user tags, which ca
           if (first) {
             intersection.push(...first);
             userTags.push(...first);
+            effectiveUserTags.push(...first);
           }
         }
       }
@@ -869,8 +1240,14 @@ All tags that come with the work will be first added to your user tags, which ca
         console.log("\taddTags:", addTags);
       } else continue;
 
-      promptBottom.innerText = `处理中，请勿关闭窗口 / Processing. Please do not close the window.\n${work.alt}`;
-      await updateBookmarkTags([bookmarkId], addTags);
+      promptBottom.innerText = `处理中，请勿关闭窗口 / Processing. Please do not close the window.\n${getWorkAlt(work)}`;
+      await updateBookmarkTags(
+        [bookmarkId],
+        addTags,
+        undefined,
+        undefined,
+        targetWorkType,
+      );
 
       if (!window.runFlag) {
         promptBottom.innerText =
@@ -917,12 +1294,15 @@ async function handleSearch(evt) {
     );
   }
 
+  const targetWorkType =
+    document.querySelector("#search_work_type")?.value || workType;
   const matchPattern = document.querySelector("#search_exact_match").value;
   const tagsLengthMatch =
     document.querySelector("#search_length_match").value === "true";
   const tagToQuery = document.querySelector("#search_select_tag").value;
   const publicationType = document.querySelector("#search_publication").value;
   const newSearch = {
+    targetWorkType,
     searchString,
     searchConfigs,
     matchPattern,
@@ -979,7 +1359,7 @@ async function handleSearch(evt) {
 
   console.log("Search Configuration:", searchConfigs);
   console.log(
-    `matchPattern: ${matchPattern}; tagsLengthMatch: ${tagsLengthMatch}; tagToQuery: ${tagToQuery}; publicationType: ${publicationType}`,
+    `workType: ${targetWorkType}; matchPattern: ${matchPattern}; tagsLengthMatch: ${tagsLengthMatch}; tagToQuery: ${tagToQuery}; publicationType: ${publicationType}`,
   );
   console.log("includeArray:", includeArray, "excludeArray", excludeArray);
 
@@ -993,6 +1373,8 @@ async function handleSearch(evt) {
       tagToQuery,
       searchOffset,
       publicationType,
+      100,
+      targetWorkType,
     );
     searchPrompt.innerText = `
     当前搜索进度 / Searched：${searchOffset} / ${totalBookmarks}
@@ -1001,7 +1383,7 @@ async function handleSearch(evt) {
     if (!totalBookmarks) {
       totalBookmarks = bookmarks.total;
     }
-    for (let work of bookmarks["works"]) {
+    for (let work of bookmarks["works"] || []) {
       if (DEBUG) {
         console.log(searchOffset, work.title, work.id);
         console.log(work["tags"]);
@@ -1009,11 +1391,13 @@ async function handleSearch(evt) {
       index++;
       searchOffset++;
 
-      if (work.title === "-----") continue;
+      if (work.title === "-----" || work.isMasked === true) continue;
+      work._workType = targetWorkType;
+      const bookmarkId = work?.["bookmarkData"]?.["id"];
       const bookmarkTags =
-        bookmarks["bookmarkTags"][work["bookmarkData"]["id"]] || []; // empty if uncategorized
+        (bookmarkId && bookmarks?.["bookmarkTags"]?.[bookmarkId]) || []; // empty if uncategorized
       work.bookmarkTags = bookmarkTags;
-      const workTags = work["tags"];
+      const workTags = work["tags"] || [];
 
       const ifInclude = (keyword) => {
         // especially, R-18 tag is labelled in work
@@ -1021,7 +1405,7 @@ async function handleSearch(evt) {
           return work["xRestrict"];
 
         const index = searchStringArray.findIndex((kw) => kw.includes(keyword));
-        const config = searchConfigs[index];
+        const config = searchConfigs[index] || [true, true, true, true];
         if (DEBUG) console.log(keyword, config);
 
         // convert input keyword to a user tag
@@ -1053,7 +1437,9 @@ async function handleSearch(evt) {
         if (
           keywordArray.some(
             (kw) =>
-              (config[0] && stringIncludes(work.title, kw)) ||
+              (config[0] &&
+                (stringIncludes(work.title, kw) ||
+                  (work.seriesTitle && stringIncludes(work.seriesTitle, kw)))) ||
               (config[1] && stringIncludes(work["userName"], kw)) ||
               (config[2] && arrayIncludes(workTags, kw)) ||
               (config[3] && arrayIncludes(bookmarkTags, kw)),
@@ -1100,7 +1486,9 @@ async function handleSearch(evt) {
 }
 
 function displayWork(work, resultsDiv, textColor) {
-  const tagsString = work.tags
+  const isNovel = work._workType === "novels" || isNovelWork(work);
+  const workUrl = getWorkUrl(work, isNovel ? "novels" : "illusts");
+  const tagsString = (work.tags || [])
     .slice(0, 6)
     .map((i) => "#" + i)
     .join(" ");
@@ -1108,20 +1496,38 @@ function displayWork(work, resultsDiv, textColor) {
   const profile =
     work["profileImageUrl"] ||
     "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+  const charCount = work["textCount"] ?? work["wordCount"] ?? 0;
+  const badgeText = isNovel
+    ? `${charCount}字`
+    : work["pageCount"];
+  const seriesHtml =
+    isNovel && work["seriesTitle"]
+      ? `<div class="mb-1 text-truncate" style="font-size: 11px; opacity: 0.78;" title="${work["seriesTitle"]}">📚 ${work["seriesTitle"]}</div>`
+      : "";
+  const rawDesc =
+    isNovel && work["description"]
+      ? work["description"]
+          .replace(/<br\s*\/?>/gi, " ")
+          .replace(/<[^>]+>/g, "")
+          .trim()
+      : "";
+  const descSnippet = rawDesc
+    ? `<div class="mb-1" style="font-size: 11px; opacity: 0.72; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">${rawDesc}</div>`
+    : "";
   container.className = "col-4 col-lg-3 col-xl-2 p-1";
   container.innerHTML = `
-       <div class="mb-1 position-relative">
+       <div class="mb-1 position-relative" style="cursor: pointer;">
          <img src=${work.url} alt="square" class="rounded-3 img-fluid" />
          <div class="position-absolute w-100" style="pointer-events: none; top: 0;">
            <div class="p-1 d-flex">
              <div class="rate-icon d-none">R-18</div>
              <div class="ms-auto page-icon d-none">
-               <span class="gbNjFx">
+               <span class="gbNjFx ${isNovel ? "d-none" : ""}">
                  <svg viewBox="0 0 9 10" width="9" height="9" class="sc-14heosd-1 fArvVr">
                    <path d="M8,3 C8.55228475,3 9,3.44771525 9,4 L9,9 C9,9.55228475 8.55228475,10 8,10 L3,10 C2.44771525,10 2,9.55228475 2,9 L6,9 C7.1045695,9 8,8.1045695 8,7 L8,3 Z M1,1 L6,1    C6.55228475,1 7,1.44771525 7,2 L7,7 C7,7.55228475 6.55228475,8 6,8 L1,8 C0.44771525,8    0,7.55228475 0,7 L0,2 C0,1.44771525 0.44771525,1 1,1 Z" transform=""></path>
                  </svg>
                </span>
-               <span class="ms-1 page-count">${work["pageCount"]}</span>
+               <span class="ms-1 page-count">${badgeText}</span>
              </div>
            </div>
          </div>
@@ -1129,13 +1535,15 @@ function displayWork(work, resultsDiv, textColor) {
        <div class="mb-1" style="font-size: 10px; color: rgb(61, 118, 153); pointer-events: none">
          ${tagsString}
        </div>
+       ${seriesHtml}
        <div class="mb-1">
-         <a href=${"/artworks/" + work.id}
+         <a href=${workUrl}
           target="_blank" rel="noreferrer"
           style="font-weight: bold; color: ${textColor};">
           ${work.title}
           </a>
        </div>
+       ${descSnippet}
        <div class="mb-4">
         <a href=${"/users/" + work["userId"]}  target="_blank" rel="noreferrer"
           style="rgba(0, 0, 0, 0.64)">
@@ -1149,7 +1557,7 @@ function displayWork(work, resultsDiv, textColor) {
       `;
   if (work["xRestrict"])
     container.querySelector(".rate-icon").classList.remove("d-none");
-  if (work["pageCount"] > 1)
+  if (isNovel ? charCount > 0 : work["pageCount"] > 1)
     container.querySelector(".page-icon").classList.remove("d-none");
   container.firstElementChild.addEventListener("click", (evt) =>
     galleryMode(evt, work),
@@ -1159,11 +1567,11 @@ function displayWork(work, resultsDiv, textColor) {
 
 function galleryMode(evt, work) {
   if (DEBUG) console.log(work);
-  const modal = evt.composedPath().find((el) => el.id.includes("modal"));
+  const modal = evt.composedPath().find((el) => el.id && el.id.includes("modal"));
   const scrollTop = modal.scrollTop;
   const dialog = evt
     .composedPath()
-    .find((el) => el.className.includes("modal-dialog"));
+    .find((el) => el.className && el.className.includes("modal-dialog"));
   dialog.classList.add("modal-fullscreen");
   const title = dialog.querySelector(".modal-header");
   const body = dialog.querySelector(".modal-body");
@@ -1209,20 +1617,82 @@ function galleryMode(evt, work) {
     pageLoaded = false,
     masterUrl;
   function updateWork(work) {
-    masterUrl = work.url.includes("limit_unknown")
-      ? work.url
-      : host +
-        work.url
-          .match(/\/img\/.*/)[0]
-          .replace(/_(custom|square)1200/, "_master1200");
+    const isNovel = work._workType === "novels" || isNovelWork(work);
+    const workUrl = getWorkUrl(work, isNovel ? "novels" : "illusts");
+    gallery.querySelector("#gallery_link").href = workUrl;
+    pageIndex = 0;
+    pageLoaded = false;
+
+    if (isNovel) {
+      all.classList.add("d-none");
+      const charCount = work["textCount"] ?? work["wordCount"] ?? 0;
+      const readingMin = work["readingTime"]
+        ? Math.max(1, Math.round(work["readingTime"] / 60))
+        : null;
+      const tagsHtml = (work.tags || [])
+        .map(
+          (t) =>
+            `<span class="badge bg-secondary me-1 mb-1">#${t}</span>`,
+        )
+        .join("");
+      const bmTagsHtml = (work.bookmarkTags || [])
+        .map(
+          (t) =>
+            `<span class="badge bg-primary me-1 mb-1">🏷️ ${t}</span>`,
+        )
+        .join("");
+      imageContainer.innerHTML = `
+        <div class="container py-5" style="max-width: 760px;">
+          <div class="p-4 rounded-3 border">
+            <div class="d-flex flex-wrap gap-4 align-items-start mb-3">
+              <img src="${work.url}" alt="cover" class="rounded-3" style="max-width: 180px; max-height: 260px; object-fit: cover;" />
+              <div class="flex-grow-1">
+                ${
+                  work.seriesTitle
+                    ? `<div class="mb-1 opacity-75">📚 ${work.seriesTitle}</div>`
+                    : ""
+                }
+                <h4 class="fw-bold mb-2">
+                  <a href="${workUrl}" target="_blank" rel="noreferrer" style="color: inherit; text-decoration: none;">${work.title}</a>
+                </h4>
+                <div class="mb-2">
+                  <a href="/users/${work.userId}" target="_blank" rel="noreferrer" style="color: inherit;">
+                    ${work.userName}
+                  </a>
+                </div>
+                <div class="mb-2 small opacity-75">
+                  ${charCount ? `<span>${charCount} 字</span>` : ""}
+                  ${readingMin ? `<span class="ms-2">约 ${readingMin} 分钟</span>` : ""}
+                </div>
+                <div class="mb-2">${tagsHtml}</div>
+                ${bmTagsHtml ? `<div class="mb-2">${bmTagsHtml}</div>` : ""}
+                <a href="${workUrl}" target="_blank" rel="noreferrer" class="btn btn-primary btn-sm mt-2">
+                  阅读小说 / Read Novel
+                </a>
+              </div>
+            </div>
+            ${
+              work.description
+                ? `<hr /><div class="mt-3" style="line-height: 1.7; word-break: break-word;">${work.description}</div>`
+                : ""
+            }
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    const imgMatch = work.url ? work.url.match(/\/img\/.*/) : null;
+    masterUrl =
+      !work.url || work.url.includes("limit_unknown") || !imgMatch
+        ? work.url
+        : host +
+          imgMatch[0].replace(/_(custom|square)1200/, "_master1200");
     imageContainer.innerHTML = `
       <div class="text-center">
         <img class="gallery-image mb-2" src=${masterUrl} alt="master">
       </div>
     `;
-    gallery.querySelector("#gallery_link").href = "/artworks/" + work.id;
-    pageIndex = 0;
-    pageLoaded = false;
     if (work["pageCount"] > 1) all.classList.remove("d-none");
     else all.classList.add("d-none");
   }
@@ -1230,6 +1700,7 @@ function galleryMode(evt, work) {
 
   function loadAll() {
     const work = works[index];
+    if (!work || !work["pageCount"] || work["pageCount"] <= 1) return;
     [...Array(work["pageCount"] - 1).keys()].forEach((i) => {
       const p = i + 1;
       const url = masterUrl.replace("_p0_", `_p${p}_`);
@@ -1254,12 +1725,14 @@ function galleryMode(evt, work) {
   });
 
   function preFetch(work) {
-    const url = work.url.includes("limit_unknown")
-      ? work.url
-      : host +
-        work.url
-          .match(/\/img\/.*/)[0]
-          .replace(/_(custom|square)1200/, "_master1200");
+    if (!work || work._workType === "novels" || isNovelWork(work)) return;
+    const imgMatch = work.url ? work.url.match(/\/img\/.*/) : null;
+    const url =
+      !work.url || work.url.includes("limit_unknown") || !imgMatch
+        ? work.url
+        : host +
+          imgMatch[0].replace(/_(custom|square)1200/, "_master1200");
+    if (!url) return;
     const img = new Image();
     img.src = url;
   }
@@ -1286,6 +1759,8 @@ function galleryMode(evt, work) {
     gallery.scrollTo({ top: scrollY + elemTop });
   }
   function down() {
+    if (works[index]?._workType === "novels" || isNovelWork(works[index]))
+      return;
     if (!pageLoaded) return loadAll();
     const scrollY = gallery.scrollTop;
     pageIndex = Math.min(pageIndex + 1, works[index]["pageCount"] - 1);
@@ -1310,6 +1785,8 @@ function galleryMode(evt, work) {
 }
 
 let prevTag,
+  prevGeneratorWorkType,
+  prevGeneratorPublication,
   prevRestriction,
   totalAvailable,
   generatorBookmarks,
@@ -1318,6 +1795,8 @@ let prevTag,
   generatorBatchNum;
 async function handleGenerate(evt) {
   evt.preventDefault();
+  const targetWorkType =
+    document.querySelector("#generator_work_type")?.value || workType;
   const tag = document.querySelector("#generator_select_tag").value;
   const batchSize = Math.max(
     0,
@@ -1329,7 +1808,7 @@ async function handleGenerate(evt) {
   const restriction = document.querySelector(
     "#generator_form_restriction",
   ).value;
-  console.log(tag, batchSize, publicationType, restriction);
+  console.log(targetWorkType, tag, batchSize, publicationType, restriction);
   if (
     !tag &&
     !confirm(
@@ -1346,8 +1825,15 @@ async function handleGenerate(evt) {
   const display = document.querySelector("#generator_display");
   display.classList.remove("d-none");
   const prompt = document.querySelector("#generator_save_tag_prompt");
-  if (prevTag !== tag || !generatorBookmarks?.length) {
+  if (
+    prevTag !== tag ||
+    prevGeneratorWorkType !== targetWorkType ||
+    prevGeneratorPublication !== publicationType ||
+    !generatorBookmarks?.length
+  ) {
     prevTag = tag;
+    prevGeneratorWorkType = targetWorkType;
+    prevGeneratorPublication = publicationType;
     prevRestriction = null;
     generatorDisplayLimit = 12;
     generatorBookmarks = [];
@@ -1360,12 +1846,23 @@ async function handleGenerate(evt) {
       "正在加载收藏夹信息，点击停止可中断运行 / Loading bookmarks, Click stop to abort";
     do {
       if (!window.runFlag) break;
-      const bookmarks = await fetchBookmarks(uid, tag, offset, publicationType);
+      const bookmarks = await fetchBookmarks(
+        uid,
+        tag,
+        offset,
+        publicationType,
+        100,
+        targetWorkType,
+      );
       if (!total) {
         total = bookmarks.total;
         prompt.innerText = `正在加载收藏夹信息（${total}），点击停止可中断运行 / Loading bookmarks (${total}), Click stop to abort`;
       }
-      generatorBookmarks.push(...bookmarks["works"]);
+      const fetchedWorks = (bookmarks["works"] || []).map((w) => {
+        w._workType = targetWorkType;
+        return w;
+      });
+      generatorBookmarks.push(...fetchedWorks);
       offset = generatorBookmarks.length;
     } while (offset < total);
     prompt.classList.add("d-none");
@@ -1389,7 +1886,7 @@ async function handleGenerate(evt) {
   }
   if (!totalAvailable) {
     display.classList.add("d-none");
-    prompt.innerText = "图片加载失败 / Image Loading Failed";
+    prompt.innerText = "作品加载失败 / Works Loading Failed";
     return;
   }
   document.querySelector("#generator_form_buttons").classList.remove("d-none");
@@ -1570,11 +2067,11 @@ function createModalElements() {
           </button>
           <div class="px-3 fw-light collapse ${showLatest}" id="latest_content">
             <div class="mb-3">
-              <div>如果对以下配置有疑惑，请参考<a href="https://greasyfork.org/zh-CN/scripts/423823-pixiv%E6%94%B6%E8%97%8F%E5%A4%B9%E8%87%AA%E5%8A%A8%E6%A0%87%E7%AD%BE?locale_override=1" style="text-decoration: underline"
+              <div>如果对以下配置有疑惑，请参考<a href="https://github.com/Lorentz114514/LabelPixivBookmarks#cn_doc" style="text-decoration: underline"
                   target="_blank" rel="noreferrer">文档</a>
               </div>
               <div>Please refer to the
-                <a href="https://greasyfork.org/en/scripts/423823-pixiv%E6%94%B6%E8%97%8F%E5%A4%B9%E8%87%AA%E5%8A%A8%E6%A0%87%E7%AD%BE" style="text-decoration: underline"
+                <a href="https://github.com/Lorentz114514/LabelPixivBookmarks" style="text-decoration: underline"
                   target="_blank" rel="noreferrer">document</a> if confused.
               </div>
             </div>
@@ -1652,14 +2149,35 @@ function createModalElements() {
           </div>
         </div>
         <div class="mb-4">
-          <button type="button" class="btn p-0 mb-3" data-bs-toggle="collapse" data-bs-target="#label_tag_query">
+          <button type="button" class="btn p-0 mb-3" data-bs-toggle="collapse" data-bs-target="#label_range_config">
             &#9658; 自动标签范围 / Auto Labeling For
           </button>
-          <select id="label_tag_query"
-            class="form-select select-custom-tags px-3 collapse show ${bgColor}">
-            <option value="未分類">未分类作品 / Uncategorized Only</option>
-            <option value="">全部作品 / All Works</option>
-          </select>
+          <div class="collapse show px-3" id="label_range_config">
+            <div class="row mb-2">
+              <div class="col-6">
+                <label class="form-label fw-light" for="label_work_type">作品类型 / Work Type</label>
+                <select id="label_work_type" class="form-select work-type-select ${bgColor}">
+                  <option value="illusts">插画・漫画 / Artworks</option>
+                  <option value="novels">小说 / Novels</option>
+                </select>
+              </div>
+              <div class="col-6">
+                <label class="form-label fw-light" for="label_publication">作品公开类型 / Publication Type</label>
+                <select id="label_publication" class="form-select ${bgColor}">
+                  <option value="show">公开收藏 / Public</option>
+                  <option value="hide">私密收藏 / Private</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label class="form-label fw-light" for="label_tag_query">目标标签 / Target Tag</label>
+              <select id="label_tag_query"
+                class="form-select select-custom-tags ${bgColor}">
+                <option value="未分類">未分类作品 / Uncategorized Only</option>
+                <option value="">全部作品 / All Works</option>
+              </select>
+            </div>
+          </div>
         </div>
         <div class="mb-4">
           <button type="button" class="btn p-0 mb-3" data-bs-toggle="collapse" data-bs-target="#advanced_label">&#9658; 高级设置 / Advanced</button>
@@ -1670,7 +2188,7 @@ function createModalElements() {
                 <br />
                 Ignore following tags (delimited by line/space, case-sensitive)
               </label>
-              <textarea id="label_exclusion" class="form-control" rows="2" id="tag_alias" style="min-height: initial" placeholder="オリジナル"></textarea>
+              <textarea id="label_exclusion" class="form-control" rows="2" style="min-height: initial" placeholder="オリジナル"></textarea>
             </div>
             <div class="mb-3">
               <label class="form-label fw-light" for="label_add_first">
@@ -1749,6 +2267,17 @@ function createModalElements() {
                 <option value="false">否 / No</option>
               </select>
             </div>
+            <div class="mb-3">
+              <label class="form-label fw-light" for="label_share_tags">
+                是否同时匹配另一分类（插画/小说）收藏夹中的已有标签
+                <br />
+                Whether to also match existing bookmark tags from the other category (Artworks/Novels)
+              </label>
+              <select id="label_share_tags" class="form-select ${bgColor}">
+                <option value="true">是 / Yes</option>
+                <option value="false">否 / No</option>
+              </select>
+            </div>
           </div>
         </div>
         <div class="mb-4">
@@ -1809,7 +2338,7 @@ function createModalElements() {
     <div class="modal-dialog modal-xl d-flex flex-column ${bgColor} ${textColor}" style="pointer-events: initial">
       <div class="gallery overflow-auto no-scroll flex-grow-1 d-none"></div>
       <div class="modal-header">
-        <h5 class="modal-title">搜索图片标签 / Search Bookmarks</h5>
+        <h5 class="modal-title">搜索收藏标签 / Search Bookmarks</h5>
         <button class="btn btn-close btn-close-empty ms-auto" id="search_pin">${defaultPinConfig}</button>
         <button class="btn btn-close btn-close-empty ms-3" data-bs-dismiss="modal">${svgClose}</button>
       </div>
@@ -1818,13 +2347,13 @@ function createModalElements() {
             <div class="mb-3">
               <label class="form-label" for="search_value">
                 输入要搜索的关键字，使用空格分隔，在关键字前加<strong>感叹号</strong>来排除该关键字。将会结合用户设置的同义词词典，
-                在收藏的图片中寻找标签匹配的图片展示在下方。当收藏时间跨度较大时，使用自定义标签缩小范围以加速搜索。
+                在收藏的作品（插画・漫画或小说）中寻找标签匹配的作品展示在下方。当收藏时间跨度较大时，使用自定义标签缩小范围以加速搜索。
                 <br />
                 点击输入框右侧的切换按钮切换至高级搜索模式，此时可以限制该关键词的搜索范围，单个输入框只接受一个关键词。
                 <br />
                 Enter keywords seperated by spaces to launch a search. Add a <strong>Exclamation Mark</strong>
                 before any keyword to exclude it. The search process will use your synonym dictionary to look up the tags
-                of your bookmarked images. Use custom tag to narrow the search if images come from a wide time range.
+                of your bookmarked artworks or novels. Use custom tag to narrow the search if works come from a wide time range.
                 <br />
                 Clicking the button on the right will toggle to advanced search mode, where you are able to choose
                 the search fields of each keyword. Note that in this mode only single keyword is accepted for each input box.
@@ -1840,6 +2369,13 @@ function createModalElements() {
               data-bs-toggle="collapse" data-bs-target="#advanced_search"
               type="button" id="advanced_search_controller">&#9658; 高级设置 / Advanced</button>
             <div class="mb-3 px-3 collapse" id="advanced_search">
+              <div class="mb-2">
+                <label class="form-label fw-light">作品类型 / Work Type</label>
+                <select class="form-select work-type-select ${bgColor}" id="search_work_type">
+                  <option value="illusts">插画・漫画 / Artworks</option>
+                  <option value="novels">小说 / Novels</option>
+                </select>
+              </div>
               <div class="mb-2">
                 <label class="form-label fw-light">标签匹配模式 / Match Pattern</label>
                 <select class="form-select ${bgColor}" id="search_exact_match">
@@ -1913,7 +2449,7 @@ function createModalElements() {
     <div class="modal-dialog modal-xl d-flex flex-column ${bgColor} ${textColor}" style="pointer-events: initial">
       <div class="gallery overflow-auto no-scroll flex-grow-1 d-none"></div>
       <div class="modal-header">
-        <h5 class="modal-title">展示随机图片 / Display Shuffled Images</h5>
+        <h5 class="modal-title">展示随机作品 / Display Shuffled Works</h5>
         <button class="btn btn-close btn-close-empty ms-auto" id="generator_pin">${defaultPinConfig}</button>
         <button class="btn btn-close btn-close-empty ms-3" data-bs-dismiss="modal">${svgClose}</button>
       </div>
@@ -1927,20 +2463,20 @@ function createModalElements() {
         </div>
         <div>
           <label class="form-label mb-3">
-            选择已收藏的标签，填写批量大小等参数后，点击<strong>生成</strong>按钮生成数组随机图片。
+            选择已收藏的标签，填写批量大小等参数后，点击<strong>生成</strong>按钮生成数组随机作品。
             点击<strong>保存至新标签</strong>可以按批次保存至临时标签，随后可以修改标签名称。
             <br />
-            点击缩略图进入鉴赏模式，可以使用上下左右方向键切换浏览的图片，点击左上角X按钮回到原模式。
+            点击缩略图进入鉴赏/预览模式，可以使用左右方向键切换浏览的作品，点击左上角X按钮回到原模式。
             <br />
-            本功能可以用来随机浏览收藏的图片，或是将较大的收藏标签切分为数个较小的收藏标签。本页面仍在开发阶段，欢迎留言。
+            本功能可以用来随机浏览收藏的插画或小说，或是将较大的收藏标签切分为数个较小的收藏标签。本页面仍在开发阶段，欢迎留言。
             <br />
             Select a tag you have bookmarked and set batch size and other configs before generating.
-            Click on <strong>Generate</strong> to get batches of shuffled images. Click on <strong>Save to Tag</strong>
+            Click on <strong>Generate</strong> to get batches of shuffled works. Click on <strong>Save to Tag</strong>
             will add a temperate tag to each batch that you can edit later.
             <br />
-            Click on the thumbnail to enter gallery mode, where you can use four arrow key to switch between pages. Click the X on the top left to exit gallery mode.
+            Click on the thumbnail to enter gallery/preview mode, where you can use arrow keys to switch between works. Click the X on the top left to exit gallery mode.
             <br />
-            This function is used to view random images, or slice a big tag into smaller ones. This page is in development and suggestions are welcomed.
+            This function is used to view random artworks/novels, or slice a big tag into smaller ones. This page is in development and suggestions are welcomed.
           </label>
           <form class="mb-3" id="generator_form">
             <select class="mb-3 form-select select-custom-tags flex-grow-1 ${bgColor}" id="generator_select_tag">
@@ -1948,18 +2484,25 @@ function createModalElements() {
               <option value="">所有收藏 / All Works</option>
             </select>
             <div class="row">
-              <div class="col-4">
+              <div class="col-3">
+                <label for="generator_work_type" class="form-label fw-light">作品类型 / Work Type</label>
+                <select class="form-select work-type-select ${bgColor}" id="generator_work_type">
+                  <option value="illusts">插画・漫画 / Artworks</option>
+                  <option value="novels">小说 / Novels</option>
+                </select>
+              </div>
+              <div class="col-3">
                 <label for="generator_form_num" class="form-label fw-light">批量大小 / Batch Size</label>
                 <input type="text" class="form-control me-3" value="100" id="generator_form_num" />
               </div>
-              <div class="col-4">
+              <div class="col-3">
                 <label for="generator_form_publication" class="form-label fw-light">作品公开类型 / Publication Type</label>
                 <select class="form-select ${bgColor}" id="generator_form_publication">
                   <option value="show">公开收藏 / Public</option>
                   <option value="hide">私密收藏 / Private</option>
                 </select>
               </div>
-              <div class="col-4">
+              <div class="col-3">
                 <label for="generator_form_restriction" class="form-label fw-light">作品限制类型 / Restriction Type</label>
                 <select class="form-select ${bgColor}" id="generator_form_restriction">
                   <option value="all">全部作品 / All</option>
@@ -2020,6 +2563,8 @@ function createModalElements() {
   });
   generatorButtons[1].addEventListener("click", async () => {
     window.runFlag = true;
+    const targetWorkType =
+      document.querySelector("#generator_work_type")?.value || workType;
     const tag = document.querySelector("#generator_select_tag").value;
     const restriction = document.querySelector(
       "#generator_form_restriction",
@@ -2045,7 +2590,7 @@ function createModalElements() {
         .slice(index * batchSize, (index + 1) * batchSize)
         .map((w) => w["bookmarkData"]["id"]);
       // console.log(addTag, ids);
-      await updateBookmarkTags(ids, [addTag]);
+      await updateBookmarkTags(ids, [addTag], null, null, targetWorkType);
     }
     window.runFlag = false;
     prompt.classList.add("d-none");
@@ -2099,16 +2644,23 @@ function createModalElements() {
         </label>
         <div class="mb-4">
           <div class="row mb-3">
-            <div class="col-6">
+            <div class="col-4">
+              <label for="feature_work_type" class="form-label fw-light">作品类型 / Work Type</label>
+              <select class="form-select work-type-select ${bgColor}" id="feature_work_type">
+                <option value="illusts">插画・漫画 / Artworks</option>
+                <option value="novels">小说 / Novels</option>
+              </select>
+            </div>
+            <div class="col-4">
               <label for="feature_form_publication" class="form-label fw-light">作品公开类型 / Publication Type</label>
               <select class="form-select ${bgColor}" id="feature_form_publication">
                   <option value="show">公开收藏 / Public</option>
                   <option value="hide">私密收藏 / Private</option>
                </select>
             </div>
-            <div class="col-6">
+            <div class="col-4">
               <label for="feature_select_tag" class="form-label fw-light">作品标签 / Tag</label>
-              <select class="col-6 form-select select-custom-tags flex-grow-1 ${bgColor}" id="feature_select_tag">
+              <select class="form-select select-custom-tags flex-grow-1 ${bgColor}" id="feature_select_tag">
                 <option value="">所有收藏 / All Works</option>
               </select>
             </div>
@@ -2232,6 +2784,8 @@ function createModalElements() {
   );
 
   // tag related
+  const featureWorkTypeSelect = featureModal.querySelector("#feature_work_type");
+  const getFeatureWorkType = () => featureWorkTypeSelect?.value || workType;
   const featurePublicationType = featureModal.querySelector(
     "#feature_form_publication",
   );
@@ -2239,13 +2793,20 @@ function createModalElements() {
   const featureTagButtons = featureModal
     .querySelector("#feature_tag_buttons")
     .querySelectorAll("button");
-  async function featureFetchWorks(tag, publicationType, progressBar) {
+  async function featureFetchWorks(
+    tag,
+    publicationType,
+    progressBar,
+    customWorkType,
+  ) {
     if (window.runFlag === false) return;
     window.runFlag = true;
-    const tag_ = tag || featureTag.value;
+    const targetWorkType = customWorkType || getFeatureWorkType();
+    const tag_ = tag !== undefined ? tag : featureTag.value;
     const publicationType_ = publicationType || featurePublicationType.value;
-    if (tag_ === "" && cachedBookmarks[publicationType_])
-      return cachedBookmarks[publicationType_];
+    const cacheKey = `${targetWorkType}_${publicationType_}`;
+    if (tag_ === "" && cachedBookmarks[cacheKey])
+      return cachedBookmarks[cacheKey];
     const progressBar_ = progressBar || featureProgressBar;
     featurePrompt.innerText =
       "正在获取收藏夹信息 / Fetching bookmark information";
@@ -2255,10 +2816,11 @@ function createModalElements() {
       tag_,
       publicationType_,
       progressBar_,
+      targetWorkType,
     );
     if (DEBUG) console.log(totalWorks);
     if (tag_ === "" && totalWorks)
-      cachedBookmarks[publicationType_] = totalWorks;
+      cachedBookmarks[cacheKey] = totalWorks;
     return totalWorks || [];
   }
   // toggle publication type
@@ -2269,6 +2831,7 @@ function createModalElements() {
           `没有获取到收藏夹内容，操作中断，请检查选项下是否有作品\nFetching bookmark information failed. Abort operation. Please check the existence of works with the configuration`,
         );
       }
+      const targetWorkType = getFeatureWorkType();
       const tag = featureTag.value;
       const publicationType = featurePublicationType.value;
       const restrict = publicationType === "show" ? "private" : "public";
@@ -2291,6 +2854,7 @@ All works of tag ${tag || "All Works"} and type ${
         works.map((w) => w["bookmarkData"]["id"]),
         restrict,
         progressBar,
+        targetWorkType,
       );
       setTimeout(() => {
         instance.hide();
@@ -2302,14 +2866,17 @@ All works of tag ${tag || "All Works"} and type ${
   featureTagButtons[1].addEventListener("click", async () => {
     const publicationType = featurePublicationType.value;
     const tag = featureTag.value;
-    await deleteTag(tag, publicationType);
+    await deleteTag(tag, publicationType, getFeatureWorkType());
   });
   // clear tag
   featureTagButtons[2].addEventListener("click", () =>
-    featureFetchWorks().then(clearBookmarkTags),
+    featureFetchWorks().then((works) =>
+      clearBookmarkTags(works, getFeatureWorkType()),
+    ),
   );
   // rename tag
   featureTagButtons[3].addEventListener("click", async () => {
+    const targetWorkType = getFeatureWorkType();
     const tag = featureTag.value;
     let newName = featureModal.querySelector(
       "input#feature_new_tag_name",
@@ -2321,7 +2888,7 @@ All works of tag ${tag || "All Works"} and type ${
     if (!newName)
       return window.alert(`新标签名不可以为空！\nEmpty New Tag Name!`);
     const type = featurePublicationType.value === "show" ? "public" : "private";
-    if (userTagDict[type].find((e) => e.tag === newName))
+    if ((userTagDict?.[type] || []).find((e) => e.tag === newName))
       if (
         !window.confirm(
           `将会合并标签【${tag}】至【${newName}】，是否继续？\nWill merge tag ${tag} into ${newName}. Is this Okay?`,
@@ -2353,11 +2920,11 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
     featureProgress.classList.remove("d-none");
     const id = setInterval(() => {
       fetch(
-        `https://www.pixiv.net/ajax/illusts/bookmarks/rename_tag_progress?lang=${lang}`,
+        `https://www.pixiv.net/ajax/${targetWorkType}/bookmarks/rename_tag_progress?lang=${lang}`,
       )
         .then((resRaw) => resRaw.json())
         .then((res) => {
-          if (res.body["isInProgress"]) {
+          if (res.body?.["isInProgress"]) {
             const estimate = res.body["estimatedSeconds"];
             const elapsed = (Date.now() - startTime) / 1000;
             const ratio =
@@ -2376,32 +2943,36 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
           }
         });
     }, 1000);
-    await fetch("https://www.pixiv.net/ajax/illusts/bookmarks/rename_tag", {
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json; charset=utf-8",
-        "x-csrf-token": token,
+    await fetch(
+      `https://www.pixiv.net/ajax/${targetWorkType}/bookmarks/rename_tag`,
+      {
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json; charset=utf-8",
+          "x-csrf-token": token,
+        },
+        body: JSON.stringify({ newTagName: newName, oldTagName: tag }),
+        method: "POST",
       },
-      body: JSON.stringify({ newTagName: newName, oldTagName: tag }),
-      method: "POST",
-    });
+    );
   });
   // batch removing invalid bookmarks
   const batchRemoveButton = featureModal
     .querySelector("#feature_batch_remove_invalid_buttons")
     .querySelector("button");
   batchRemoveButton.addEventListener("click", async () => {
+    const targetWorkType = getFeatureWorkType();
     const display = featureModal.querySelector(
       "#feature_batch_remove_invalid_display",
     );
     featureProgress.classList.remove("d-none");
     const invalidShow = (
-      await featureFetchWorks("", "show", featureProgressBar)
-    ).filter((w) => w.title === "-----");
+      await featureFetchWorks("", "show", featureProgressBar, targetWorkType)
+    ).filter((w) => w.title === "-----" || w.isMasked === true);
     if (DEBUG) console.log("invalidShow", invalidShow);
     const invalidHide = (
-      await featureFetchWorks("", "hide", featureProgressBar)
-    ).filter((w) => w.title === "-----");
+      await featureFetchWorks("", "hide", featureProgressBar, targetWorkType)
+    ).filter((w) => w.title === "-----" || w.isMasked === true);
     if (DEBUG) console.log("invalidHide", invalidHide);
     if (window.runFlag) {
       featurePrompt.classList.add("d-none");
@@ -2448,7 +3019,7 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
             return;
           window.runFlag = true;
           const bookmarkIds = [...invalidShow, ...invalidHide]
-            .filter((w) => !w.associatedTags.includes("INVALID"))
+            .filter((w) => !(w.associatedTags || []).includes("INVALID"))
             .map((w) => w["bookmarkData"]["id"]);
           featureProgress.classList.remove("d-none");
           featurePrompt.classList.remove("d-none");
@@ -2459,6 +3030,7 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
             ["INVALID"],
             null,
             featureProgressBar,
+            targetWorkType,
           );
           featurePrompt.innerText =
             "标记完成，即将刷新页面 / Updated. The page is going to reload.";
@@ -2485,7 +3057,7 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
           featurePrompt.classList.remove("d-none");
           featurePrompt.innerText =
             "删除中，请稍后 / Removing invalid bookmarks";
-          await removeBookmark(bookmarkIds, featureProgressBar);
+          await removeBookmark(bookmarkIds, featureProgressBar, targetWorkType);
           featurePrompt.innerText =
             "已删除，即将刷新页面 / Removed. The page is going to reload.";
           setTimeout(() => {
@@ -2510,18 +3082,29 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
     .querySelectorAll("button");
   // backup
   featureBookmarkButtons[0].addEventListener("click", async () => {
+    const targetWorkType = getFeatureWorkType();
     featureProgress.classList.remove("d-none");
-    const show = await featureFetchWorks("", "show", featureProgressBar);
-    const hide = await featureFetchWorks("", "hide", featureProgressBar);
+    const show = await featureFetchWorks(
+      "",
+      "show",
+      featureProgressBar,
+      targetWorkType,
+    );
+    const hide = await featureFetchWorks(
+      "",
+      "hide",
+      featureProgressBar,
+      targetWorkType,
+    );
     if (window.runFlag) {
-      const bookmarks = { show, hide };
+      const bookmarks = { workType: targetWorkType, show, hide };
       const a = document.createElement("a");
       a.href = URL.createObjectURL(
         new Blob([JSON.stringify(bookmarks)], { type: "application/json" }),
       );
       a.setAttribute(
         "download",
-        `label_pixiv_bookmarks_backup_${new Date().toLocaleDateString()}.json`,
+        `label_pixiv_bookmarks_${targetWorkType}_backup_${new Date().toLocaleDateString()}.json`,
       );
       a.click();
       featurePrompt.innerText = "备份成功 / Backup successfully";
@@ -2544,23 +3127,31 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
       reader.onload = async (evt) => {
         let json = {};
         const invalidArray = [];
-        async function run(type) {
-          const col = await featureFetchWorks("", type, featureProgressBar);
-          if (!window.runFlag) return;
-          for (let work of col.filter((w) => w.title === "-----")) {
-            const jsonWork = json[type].find(
-              (w) => w.id.toString() === work.id.toString(),
-            );
-            invalidArray.push(jsonWork || work);
-            if (DEBUG) console.log(jsonWork);
-          }
-        }
         try {
-          eval("json = " + evt.target.result.toString());
+          json = JSON.parse(evt.target.result.toString());
           if (!json["show"])
             return alert(
               "请检查是否加载了正确的收藏夹备份\nPlease check if the backup file is correct",
             );
+          const targetWorkType = json.workType || getFeatureWorkType();
+          async function run(type) {
+            const col = await featureFetchWorks(
+              "",
+              type,
+              featureProgressBar,
+              targetWorkType,
+            );
+            if (!window.runFlag) return;
+            for (let work of col.filter(
+              (w) => w.title === "-----" || w.isMasked === true,
+            )) {
+              const jsonWork = (json[type] || []).find(
+                (w) => w.id.toString() === work.id.toString(),
+              );
+              invalidArray.push(jsonWork || work);
+              if (DEBUG) console.log(jsonWork);
+            }
+          }
           if (DEBUG) console.log(json);
           featureProgress.classList.remove("d-none");
           await run("show");
@@ -2576,11 +3167,11 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
                     tags,
                     userId,
                     userName,
-                    alt,
                     associatedTags,
                     restrict,
                     xRestrict,
                   } = w;
+                  const alt = getWorkAlt(w, targetWorkType);
                   const l = lang.includes("zh") ? 0 : 1;
                   const info = [
                     ["", "", alt],
@@ -2637,7 +3228,7 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
       reader.onload = async (evt) => {
         let json = {};
         try {
-          eval("json = " + evt.target.result.toString());
+          json = JSON.parse(evt.target.result.toString());
           if (!json["show"])
             return alert(
               "请检查是否加载了正确的收藏夹备份\nPlease check if the backup file is correct",
@@ -2701,6 +3292,10 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
     if (!window.bookmarkImport?.["show"])
       return alert("加载收藏夹备份失败！\nFail to load backup bookmarks");
     const json = window.bookmarkImport;
+    const sampleWork = json.show?.[0] || json.hide?.[0];
+    const targetWorkType =
+      json.workType ||
+      (sampleWork && isNovelWork(sampleWork) ? "novels" : getFeatureWorkType());
     const pub = featureModal.querySelector(
       "#feature_import_bookmark_publication",
     ).value;
@@ -2719,7 +3314,12 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
     importWorks.reverse();
 
     featureProgress.classList.remove("d-none");
-    const existWorks = await featureFetchWorks(tag, pub, featureProgressBar);
+    const existWorks = await featureFetchWorks(
+      tag,
+      pub,
+      featureProgressBar,
+      targetWorkType,
+    );
     featurePrompt.classList.remove("d-none");
 
     const errorList = [];
@@ -2727,8 +3327,9 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
     for (let i = 0; i < importWorks.length; i++) {
       const w = importWorks[i];
       if (!window.runFlag) break;
-      let { id, title, restrict, associatedTags, alt } = w;
-      if (title === "-----") {
+      let { id, title, restrict, associatedTags } = w;
+      const alt = getWorkAlt(w, targetWorkType);
+      if (title === "-----" || w.isMasked === true) {
         errorList.push({
           message: "The creator has limited who can view this content",
           ...w,
@@ -2736,7 +3337,7 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
         continue;
       }
       if (!associatedTags) associatedTags = [];
-      const ew = existWorks.find((ew) => ew.id === id);
+      const ew = existWorks.find((ew) => String(ew.id) === String(id));
       if (ew) {
         // note that when work does not have target tag but is in exist bookmarked works, skip will not take effect
         if (mode === "skip") continue;
@@ -2748,15 +3349,28 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
         );
         if (!associatedTags) continue;
         if (mode === "merge")
-          await updateBookmarkTags([ew["bookmarkData"]["id"]], associatedTags);
+          await updateBookmarkTags(
+            [ew["bookmarkData"]["id"]],
+            associatedTags,
+            null,
+            null,
+            targetWorkType,
+          );
         else if (mode === "override")
           await updateBookmarkTags(
             [ew["bookmarkData"]["id"]],
             associatedTags,
             diff,
+            null,
+            targetWorkType,
           );
       } else {
-        const resRaw = await addBookmark(id, restrict, associatedTags);
+        const resRaw = await addBookmark(
+          id,
+          restrict,
+          associatedTags,
+          targetWorkType,
+        );
         if (!resRaw.ok) {
           const res = await resRaw.json();
           errorList.push({ ...res, ...w });
@@ -2785,11 +3399,11 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
             tags,
             userId,
             userName,
-            alt,
             associatedTags,
             xRestrict,
             message,
           } = w;
+          const alt = getWorkAlt(w, targetWorkType);
           return `${alt}\ntitle: ${title}\nid: ${id}\nuser: ${userName} - ${userId}\ntags: ${(
             tags || []
           ).join(", ")}\nuserTags: ${(associatedTags || []).join(
@@ -2818,7 +3432,6 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
   });
 
   // all tags selection modal
-  const c_ = ALL_TAGS_CONTAINER.slice(1);
   const allTagsModal = document.createElement("div");
   allTagsModal.className = "modal fade";
   allTagsModal.id = "all_tags_modal";
@@ -2829,67 +3442,84 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
         <h5 class="modal-title">收藏标签一栏 / All Bookmark Tags</h5>
         <button class="btn btn-close btn-close-empty ms-auto" data-bs-dismiss="modal">${svgClose}</button>
       </div>
-      <div class="modal-body p-4"><div class="${c_} mb-4"></div><div class="hpRxDJ"></div></div>
+      <div class="modal-body p-4"><div id="all_tags_parody_container" class="mb-4" style="display: flex; flex-wrap: wrap;"></div><div id="all_tags_char_container" style="display: flex; flex-wrap: wrap;"></div></div>
     </div>`;
-  const parodyContainer = allTagsModal.querySelector(ALL_TAGS_CONTAINER);
-  const characterContainer = [
-    ...allTagsModal.querySelectorAll(ALL_TAGS_CONTAINER),
-  ][1];
+  const parodyContainer = allTagsModal.querySelector(
+    "#all_tags_parody_container",
+  );
+  const characterContainer = allTagsModal.querySelector(
+    "#all_tags_char_container",
+  );
+  const tagBg = theme ? "rgba(0, 0, 0, 0.04)" : "rgba(255, 255, 255, 0.08)";
   userTags.forEach((tag) => {
     const d = document.createElement("div");
-    d.className = "sc-1jxp5wn-2 cdeTmC";
+    d.style.cssText = "margin: 0px 4px 8px 0px;";
     d.innerHTML = `
-        <div class="sc-d98f2c-0 sc-1ij5ui8-1 RICfj sc-1xl36rp-0 iyuGOa" role="button">
-          <div class="sc-1xl36rp-1 iUPWKW">
-            <div class="sc-1xl36rp-2 bIDszS">
-              <div title="#${tag}" class="sc-1utla24-0 bTtACY">#${tag}</div>
-            </div>
-          </div>
+        <div role="button" style="display: inline-flex; align-items: center; height: 32px; padding: 0 12px; border-radius: 4px; background: ${tagBg}; color: inherit; font-size: 14px; cursor: pointer; max-width: 240px;">
+          <div title="#${tag}" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">#${tag}</div>
         </div>`;
     d.addEventListener("click", async () => {
       try {
         const c0 = document.querySelector(ALL_TAGS_MODAL_CONTAINER);
-        const c1 = c0.lastElementChild;
-        let lastScrollTop = -1;
+        const c1 = c0?.lastElementChild;
         let targetDiv;
-        let i = 0;
-        while (
-          c1.scrollTop !== lastScrollTop &&
-          !targetDiv &&
-          i < userTags.length
-        ) {
-          targetDiv = [...c1.firstElementChild.children].find((el) =>
-            el.textContent.includes(tag),
-          );
-          if (!targetDiv) {
-            c1.scrollTop = parseInt(
-              c1.firstElementChild.lastElementChild.style.top,
+        if (c1 && c1.firstElementChild) {
+          let lastScrollTop = -1;
+          let i = 0;
+          while (
+            c1.scrollTop !== lastScrollTop &&
+            !targetDiv &&
+            i < userTags.length
+          ) {
+            targetDiv = [...c1.firstElementChild.children].find((el) =>
+              el.textContent.includes(tag),
             );
-            if ("onscrollend" in window)
-              await new Promise((r) =>
-                c1.addEventListener("scrollend", () => r(), { once: true }),
+            if (!targetDiv && c1.firstElementChild.lastElementChild) {
+              lastScrollTop = c1.scrollTop;
+              c1.scrollTop = parseInt(
+                c1.firstElementChild.lastElementChild.style.top || "0",
               );
-            else {
-              let j = 0,
-                lastText = c1.firstElementChild.lastElementChild.textContent;
-              while (
-                j < 10 &&
-                lastText === c1.firstElementChild.lastElementChild.textContent
-              ) {
-                console.log("wait");
-                await new Promise((r) => setTimeout(r, 100));
-                j++;
+              if ("onscrollend" in window)
+                await new Promise((r) =>
+                  c1.addEventListener("scrollend", () => r(), { once: true }),
+                );
+              else {
+                let j = 0,
+                  lastText = c1.firstElementChild.lastElementChild.textContent;
+                while (
+                  j < 10 &&
+                  lastText ===
+                    c1.firstElementChild.lastElementChild.textContent
+                ) {
+                  await new Promise((r) => setTimeout(r, 100));
+                  j++;
+                }
               }
             }
+            i++;
           }
-          i++;
         }
-        if (targetDiv) {
+        if (targetDiv && targetDiv.firstElementChild) {
           targetDiv.firstElementChild.click();
           allTagsModal.querySelector("button.btn-close").click();
+        } else {
+          allTagsModal.querySelector("button.btn-close").click();
+          const state = getBookmarkPageState();
+          window.location.href = getBookmarksPageUrl(
+            uid,
+            workType,
+            tag,
+            state.publicationType,
+          );
         }
       } catch (err) {
-        window.alert(`${err.name}: ${err.message}\n${err.stack}`);
+        const state = getBookmarkPageState();
+        window.location.href = getBookmarksPageUrl(
+          uid,
+          workType,
+          tag,
+          state.publicationType,
+        );
       }
     });
     if (tag.includes("(")) characterContainer.appendChild(d);
@@ -2931,19 +3561,42 @@ Tag ${tag} will be renamed to ${newName}.\n All related works (both public and p
   body.appendChild(allTagsModal);
 }
 
-async function fetchUserTags() {
-  const tagsRaw = await fetch(
-    `/ajax/user/${uid}/illusts/bookmark/tags?lang=${lang}`,
+function renderAllTagsModalContent() {
+  const allTagsModal = document.querySelector("#all_tags_modal");
+  if (!allTagsModal) return;
+  const parodyContainer = allTagsModal.querySelector(
+    "#all_tags_parody_container",
   );
-  const tagsObj = await tagsRaw.json();
-  if (tagsObj.error === true)
-    return alert(
-      `获取tags失败
-    Fail to fetch user tags` +
-        "\n" +
-        decodeURI(tagsObj.message),
-    );
-  userTagDict = tagsObj.body;
+  const characterContainer = allTagsModal.querySelector(
+    "#all_tags_char_container",
+  );
+  if (!parodyContainer || !characterContainer) return;
+  parodyContainer.innerHTML = "";
+  characterContainer.innerHTML = "";
+  const tagBg = theme ? "rgba(0, 0, 0, 0.04)" : "rgba(255, 255, 255, 0.08)";
+  (userTags || []).forEach((tag) => {
+    const d = document.createElement("div");
+    d.style.cssText = "margin: 0px 4px 8px 0px;";
+    d.innerHTML = `
+        <div role="button" style="display: inline-flex; align-items: center; height: 32px; padding: 0 12px; border-radius: 4px; background: ${tagBg}; color: inherit; font-size: 14px; cursor: pointer; max-width: 240px;">
+          <div title="#${tag}" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">#${tag}</div>
+        </div>`;
+    d.addEventListener("click", () => {
+      allTagsModal.querySelector("button.btn-close")?.click();
+      const state = getBookmarkPageState();
+      window.location.href = getBookmarksPageUrl(
+        uid,
+        workType,
+        tag,
+        state.publicationType,
+      );
+    });
+    if (tag.includes("(")) characterContainer.appendChild(d);
+    else parodyContainer.appendChild(d);
+  });
+}
+
+function parseTagListFromBody(body) {
   const userTagsSet = new Set();
   const addTag2Set = (tag) => {
     try {
@@ -2954,64 +3607,197 @@ async function fetchUserTags() {
         console.log("[Label Pixiv] Error!");
         console.log(err.name, err.message);
         console.log(err.stack);
-        window.alert(`加载标签%{tag}时出现错误，请按F12打开控制台截图错误信息并反馈至GitHub。
-Error loading tag ${tag}. Please press F12 and take a screenshot of the error message in the console and report it to GitHub.`);
       }
     }
   };
-  for (let obj of userTagDict.public) {
+  for (let obj of body?.public || []) {
     addTag2Set(obj.tag);
   }
-  for (let obj of userTagDict["private"]) {
+  for (let obj of body?.["private"] || []) {
     addTag2Set(obj.tag);
   }
   userTagsSet.delete("未分類");
   return sortByParody(Array.from(userTagsSet));
 }
 
+async function fetchUserTags(targetWorkType = workType) {
+  try {
+    const tagsRaw = await fetch(
+      `/ajax/user/${uid}/${targetWorkType}/bookmark/tags?lang=${lang}`,
+    );
+    const tagsObj = await tagsRaw.json();
+    if (tagsObj.error === true) {
+      alert(
+        `获取tags失败\nFail to fetch user tags\n` +
+          decodeURI(tagsObj.message || ""),
+      );
+      userTagDict = { public: [], private: [] };
+      return [];
+    }
+    userTagDict = tagsObj.body || { public: [], private: [] };
+  } catch (err) {
+    console.log("[Label Bookmarks] fetchUserTags error:", err);
+    userTagDict = { public: [], private: [] };
+  }
+
+  // Also quietly fetch the other category's tags for cross-category tag sharing
+  const otherType = targetWorkType === "novels" ? "illusts" : "novels";
+  try {
+    const otherRaw = await fetch(
+      `/ajax/user/${uid}/${otherType}/bookmark/tags?lang=${lang}`,
+    );
+    const otherObj = await otherRaw.json();
+    if (!otherObj.error && otherObj.body) {
+      otherTypeUserTags = parseTagListFromBody(otherObj.body);
+    }
+  } catch (_) {
+    // ignore cross-category fetch errors
+  }
+
+  return parseTagListFromBody(userTagDict);
+}
+
 async function fetchTokenPolyfill() {
-  // get token
+  // 1. Try inline scripts in current document
+  const html = document.documentElement?.innerHTML || "";
+  const inlineMatch =
+    html.match(/pixiv\.context\.token\s*=\s*"([a-f0-9]{32})"/i) ||
+    html.match(/"token"\s*:\s*"([a-f0-9]{32})"/i) ||
+    html.match(/name="tt"\s+value="([a-f0-9]{32})"/i);
+  if (inlineMatch?.[1]) return inlineMatch[1];
+
+  // 2. Try bookmark_add.php
   const userRaw = await fetch(
     "/bookmark_add.php?type=illust&illust_id=83540927",
   );
   if (!userRaw.ok) {
     console.log(`获取身份信息失败
     Fail to fetch user information`);
-    throw new Error();
+    throw new Error("Failed to fetch token");
   }
   const userRes = await userRaw.text();
+  const tokenMatch =
+    userRes.match(/pixiv\.context\.token\s*=\s*"([a-f0-9]{32})"/i) ||
+    userRes.match(/name="tt"\s+value="([a-f0-9]{32})"/i);
+  if (tokenMatch?.[1]) return tokenMatch[1];
   const tokenPos = userRes.indexOf("pixiv.context.token");
   const tokenEnd = userRes.indexOf(";", tokenPos);
   return userRes.slice(tokenPos, tokenEnd).split('"')[1];
 }
 
 async function updateWorkInfo(bookmarkTags) {
-  const el = await waitForDom(WORK_SECTION);
-  let workInfo = {};
-  for (let i = 0; i < 100; i++) {
-    workInfo = Object.values(el)[0]["memoizedProps"]["children"][2]["props"];
-    if (Object.keys(workInfo).length) break;
-    else await delay(200);
+  const urlState = getBookmarkPageState();
+  let el = null;
+  try {
+    el = await waitForDom(WORK_SECTION, document, 25);
+  } catch (_) {
+    el = document.querySelector(WORK_SECTION);
   }
-  if (bookmarkTags) {
+  let workInfo = {};
+  if (el) {
+    for (let i = 0; i < 30; i++) {
+      const props = getReactProps(el);
+      if (props && Object.keys(props).length) {
+        workInfo = { ...props };
+        break;
+      }
+      const fiber = getReactFiber(el);
+      const found = findInReactTree(
+        fiber,
+        (n) =>
+          n &&
+          typeof n === "object" &&
+          (Array.isArray(n.works) || Array.isArray(n.memoizedProps?.works)),
+        30,
+      );
+      if (found) {
+        const candidate = Array.isArray(found.works)
+          ? found
+          : found.memoizedProps;
+        if (candidate && Object.keys(candidate).length) {
+          workInfo = { ...candidate };
+          break;
+        }
+      }
+      await delay(200);
+    }
+  }
+
+  // Fallback to AJAX API if React fiber did not expose works array
+  if (!Array.isArray(workInfo.works) && urlState.isBookmarkPage && uid) {
+    try {
+      const limit = 24;
+      const offset = (urlState.page - 1) * limit;
+      const bm = await fetchBookmarks(
+        uid,
+        urlState.tag,
+        offset,
+        urlState.publicationType,
+        limit,
+        urlState.workType,
+      );
+      if (bm && Array.isArray(bm.works)) {
+        workInfo.works = bm.works.map((w) => {
+          const bmId = w?.bookmarkData?.id;
+          const tags = (bmId && bm.bookmarkTags?.[bmId]) || [];
+          return { ...w, associatedTags: tags };
+        });
+        workInfo.total = bm.total;
+      }
+    } catch (err) {
+      if (DEBUG) console.log("[Label Bookmarks] Fallback fetchBookmarks error:", err);
+    }
+  }
+
+  if (bookmarkTags && el && Array.isArray(workInfo["works"])) {
     [...el.querySelectorAll("li")].forEach((li, i) => {
-      workInfo["works"][i].associatedTags =
-        Object.values(li)[0].child.child["memoizedProps"].associatedTags;
+      if (!workInfo["works"][i]) return;
+      try {
+        const fiber = getReactFiber(li);
+        const directTags =
+          fiber?.child?.child?.memoizedProps?.associatedTags ||
+          findInReactTree(
+            fiber,
+            (n) => Array.isArray(n?.associatedTags),
+            15,
+          )?.associatedTags;
+        if (Array.isArray(directTags)) {
+          workInfo["works"][i].associatedTags = directTags;
+        } else if (!Array.isArray(workInfo["works"][i].associatedTags)) {
+          workInfo["works"][i].associatedTags = [];
+        }
+      } catch (_) {
+        if (!Array.isArray(workInfo["works"][i].associatedTags)) {
+          workInfo["works"][i].associatedTags = [];
+        }
+      }
     });
   }
-  const page = window.location.search.match(/p=(\d+)/)?.[1] || 1;
-  workInfo.page = parseInt(page);
+
+  workInfo.page = urlState.page;
+  workInfo.tag = urlState.tag;
+  workInfo.restrict = urlState.restrict;
+  workInfo.workType = urlState.workType;
+  workInfo.editMode =
+    Boolean(el?.querySelector('input[type="checkbox"]')) ||
+    Boolean(workInfo.editMode);
   return workInfo;
 }
 
+let themeObserverInitialized = false;
 async function initializeVariables() {
+  workType = detectWorkTypeFromUrl();
+  pageInfo = pageInfo || {};
+
   async function polyfill() {
     try {
-      const dataLayer = unsafeWindow_["dataLayer"][0];
-      uid = dataLayer["user_id"];
-      lang = dataLayer["lang"];
-      token = await fetchTokenPolyfill();
-      pageInfo.userId = window.location.href.match(/users\/(\d+)/)?.[1];
+      const globalInfo = getClientInfoFromGlobals();
+      uid = uid || globalInfo.uid;
+      lang = lang || globalInfo.lang || "zh";
+      token = token || globalInfo.token || (await fetchTokenPolyfill());
+      pageInfo = pageInfo || {};
+      pageInfo.userId =
+        window.location.href.match(/users\/(\d+)/)?.[1] || uid;
       pageInfo.client = { userId: uid, lang, token };
     } catch (err) {
       console.log(err);
@@ -3021,46 +3807,73 @@ async function initializeVariables() {
 
   try {
     if (DEBUG) console.log("[Label Bookmarks] Initializing Variables");
-    pageInfo = Object.values(document.querySelector(BANNER))[0]["return"][
-      "return"
-    ]["memoizedProps"];
-    if (DEBUG) console.log("[Label Bookmarks] Page Info", pageInfo);
-    uid = pageInfo["client"]["userId"];
-    token = pageInfo["client"]["token"];
-    lang = pageInfo["client"]["lang"];
+    const bannerEl = document.querySelector(BANNER);
+    const bannerFiber = getReactFiber(bannerEl);
+    const extracted =
+      bannerFiber?.return?.return?.memoizedProps ||
+      findInReactTree(
+        bannerFiber,
+        (n) => n && typeof n === "object" && n.client && n.client.userId,
+        25,
+      );
+    if (extracted) {
+      pageInfo = { ...extracted };
+      if (DEBUG) console.log("[Label Bookmarks] Page Info", pageInfo);
+      uid = pageInfo?.["client"]?.["userId"];
+      token = pageInfo?.["client"]?.["token"];
+      lang = pageInfo?.["client"]?.["lang"];
+    }
     if (!uid || !token || !lang) await polyfill();
   } catch (err) {
     console.log(err);
     await polyfill();
   }
 
-  userTags = await fetchUserTags();
+  pageInfo = pageInfo || {};
+  pageInfo.userId =
+    getBookmarkPageState().userId || pageInfo.userId || uid;
 
-  // workType = Object.values(document.querySelector(".sc-1x9383j-0"))[0].child["memoizedProps"]["workType"];
+  userTags = await fetchUserTags(workType);
 
   // switch between default and dark theme
-  const themeDiv = document.querySelector(THEME_CONTAINER);
-  theme = themeDiv.getAttribute("data-theme") === "light";
-  new MutationObserver(() => {
-    theme = themeDiv.getAttribute("data-theme") === "light";
-    const prevBgColor = theme ? "bg-dark" : "bg-white";
-    const bgColor = theme ? "bg-white" : "bg-dark";
-    const prevTextColor = theme ? "text-lp-light" : "text-lp-dark";
-    const textColor = theme ? "text-lp-dark" : "text-lp-light";
-    [...document.querySelectorAll(".bg-dark, .bg-white")].forEach((el) => {
-      el.classList.replace(prevBgColor, bgColor);
-    });
-    [...document.querySelectorAll(".text-lp-dark, .text-lp-light")].forEach(
-      (el) => {
-        el.classList.replace(prevTextColor, textColor);
-      },
-    );
-    const prevClearTag = theme ? "dydUg" : "jbzOgz";
-    const clearTag = theme ? "jbzOgz" : "dydUg";
-    const clearTagsButton = document.querySelector("#clear_tags_button");
-    if (clearTagsButton)
-      clearTagsButton.children[0].classList.replace(prevClearTag, clearTag);
-  }).observe(themeDiv, { attributes: true });
+  const themeDiv =
+    document.querySelector(THEME_CONTAINER) || document.documentElement;
+  theme = themeDiv.getAttribute("data-theme") !== "dark";
+  if (!themeObserverInitialized && themeDiv) {
+    themeObserverInitialized = true;
+    new MutationObserver(() => {
+      theme = themeDiv.getAttribute("data-theme") !== "dark";
+      const prevBgColor = theme ? "bg-dark" : "bg-white";
+      const bgColor = theme ? "bg-white" : "bg-dark";
+      const prevTextColor = theme ? "text-lp-light" : "text-lp-dark";
+      const textColor = theme ? "text-lp-dark" : "text-lp-light";
+      [...document.querySelectorAll(".bg-dark, .bg-white")].forEach((el) => {
+        el.classList.replace(prevBgColor, bgColor);
+      });
+      [...document.querySelectorAll(".text-lp-dark, .text-lp-light")].forEach(
+        (el) => {
+          el.classList.replace(prevTextColor, textColor);
+        },
+      );
+      const pillBg = theme
+        ? "rgba(0, 0, 0, 0.04)"
+        : "rgba(255, 255, 255, 0.12)";
+      const pillColor = theme
+        ? "rgba(0, 0, 0, 0.64)"
+        : "rgba(255, 255, 255, 0.88)";
+      const clearTagsButton = document.querySelector("#clear_tags_button");
+      if (clearTagsButton) {
+        clearTagsButton.style.background = pillBg;
+        clearTagsButton.style.color = pillColor;
+      }
+      const removeTagButton = document.querySelector("#remove_tag_button");
+      if (removeTagButton) {
+        removeTagButton.style.background = pillBg;
+        removeTagButton.style.color = pillColor;
+      }
+      renderAllTagsModalContent();
+    }).observe(themeDiv, { attributes: true });
+  }
 
   synonymDict = getValue("synonymDict", {});
   if (Object.keys(synonymDict).length) {
@@ -3070,13 +3883,13 @@ async function initializeVariables() {
     }
     setValue("synonymDict", synonymDict);
   }
-  if (DEBUG) console.log("[Label Bookmarks] Initialized");
+  if (DEBUG) console.log("[Label Bookmarks] Initialized, workType =", workType);
 }
 
 const maxRetries = 100;
-async function waitForDom(selector, container) {
+async function waitForDom(selector, container, retries = maxRetries) {
   let dom;
-  for (let i = 0; i < maxRetries; i++) {
+  for (let i = 0; i < retries; i++) {
     dom = (container || document).querySelector(selector);
     if (dom) return dom;
     await delay(200);
@@ -3089,288 +3902,381 @@ async function waitForDom(selector, container) {
 async function injectElements() {
   if (DEBUG) console.log("[Label Bookmarks] Start Injecting");
   const textColor = theme ? "text-lp-dark" : "text-lp-light";
-  const pageBody = document.querySelector(PAGE_BODY);
-  const root = document.querySelector("nav");
-  if (!root) console.log("[Label Bookmarks] Navbar Not Found");
-  root.classList.add("d-flex");
+  const pageBody = document.querySelector(PAGE_BODY) || document.body;
+
+  // Remove stale injected buttons if re-injecting after SPA navigation
+  document.querySelector("#label_bookmarks_buttons")?.remove();
+  document.querySelector("#clear_tags_button")?.remove();
+  document.querySelector("#remove_tag_button")?.remove();
+
   const buttonContainer = document.createElement("span");
   buttonContainer.className = "flex-grow-1 justify-content-end d-flex";
   buttonContainer.id = "label_bookmarks_buttons";
   const gClass = generator ? "" : "d-none";
   const fClass = feature ? "" : "d-none";
   buttonContainer.innerHTML = `
-        <button class="label-button ${textColor} ${fClass}" data-bs-toggle="modal" data-bs-target="#feature_modal" id="feature_modal_button"/>
-        <button class="label-button ${textColor} ${gClass}" data-bs-toggle="modal" data-bs-target="#generator_modal" id="generator_modal_button"/>
-        <button class="label-button ${textColor}" data-bs-toggle="modal" data-bs-target="#search_modal" id="search_modal_button"/>
-        <button class="label-button ${textColor}" data-bs-toggle="modal" data-bs-target="#label_modal" id="label_modal_button"/>
+        <button class="label-button ${textColor} ${fClass}" data-bs-toggle="modal" data-bs-target="#feature_modal" id="feature_modal_button"></button>
+        <button class="label-button ${textColor} ${gClass}" data-bs-toggle="modal" data-bs-target="#generator_modal" id="generator_modal_button"></button>
+        <button class="label-button ${textColor}" data-bs-toggle="modal" data-bs-target="#search_modal" id="search_modal_button"></button>
+        <button class="label-button ${textColor}" data-bs-toggle="modal" data-bs-target="#label_modal" id="label_modal_button"></button>
       `;
 
-  const clearTagsThemeClass = theme ? "OPGIe" : "bDwYXF";
+  const pillBg = theme ? "rgba(0, 0, 0, 0.04)" : "rgba(255, 255, 255, 0.12)";
+  const pillColor = theme
+    ? "rgba(0, 0, 0, 0.64)"
+    : "rgba(255, 255, 255, 0.88)";
+  const pillStyle = `display: inline-flex; align-items: center; justify-content: center; height: 32px; padding: 0 16px; border-radius: 9999px; font-size: 14px; font-weight: bold; cursor: pointer; user-select: none; transition: opacity 0.2s, background 0.2s; background: ${pillBg}; color: ${pillColor};`;
+
   const clearTagsText = lang.includes("zh") ? "清除标签" : "Clear Tags";
   const clearTagsButton = document.createElement("div");
   clearTagsButton.id = "clear_tags_button";
-  clearTagsButton.className = "sc-15a17794-0 iTJRIU sc-231887f1-7 gzddfG";
   clearTagsButton.setAttribute("aria-disabled", "true");
   clearTagsButton.setAttribute("role", "button");
-  clearTagsButton.innerHTML = `<div aria-disabled="true" class="sc-74250f2c-0 ${clearTagsThemeClass}">
-            <div class="sc-4a5gah-1 kHyYuA">
-              ${clearTagsText}
-            </div>
-          </div>`;
+  clearTagsButton.style.cssText =
+    pillStyle + " opacity: 0.35; pointer-events: none; margin-left: 8px;";
+  clearTagsButton.innerHTML = `<div aria-disabled="true"><div>${clearTagsText}</div></div>`;
   clearTagsButton.addEventListener("click", handleClearBookmarkTags);
 
   const removeTagButton = document.createElement("div");
   removeTagButton.id = "remove_tag_button";
-  removeTagButton.style.display = "none";
-  removeTagButton.style.marginRight = "16px";
-  removeTagButton.style.marginBottom = "12px";
-  removeTagButton.style.color = "rgba(0, 0, 0, 0.64)";
-  removeTagButton.style.cursor = "pointer";
+  removeTagButton.style.cssText =
+    pillStyle + " display: none; margin-right: 12px; gap: 6px;";
   removeTagButton.innerHTML = `
-    <div class="${theme ? "" : "icon-invert"}" style="margin-right: 4px">
-      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16">
+    <div style="display: inline-flex; align-items: center;">
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16">
         <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
         <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
       </svg>
     </div>
-    <div class="fw-bold ${textColor}" id="remove_tag_prompt"></div>
+    <div id="remove_tag_prompt"></div>
   `;
   removeTagButton.addEventListener("click", handleDeleteTag);
 
   async function injection(_, injectionObserver) {
-    if (_) console.log(_);
-    if (pageInfo["userId"] !== uid) {
+    const state = getBookmarkPageState();
+    const pageUserId = state.userId || pageInfo?.["userId"];
+    if (pageUserId && uid && String(pageUserId) !== String(uid)) {
       if (DEBUG)
         console.log(
           "[Label Bookmarks] Aborted Injection due to mismatch homepage",
+          pageUserId,
+          uid,
         );
       return true;
+    }
+    if (!state.isBookmarkPage) {
+      if (DEBUG)
+        console.log(
+          "[Label Bookmarks] Currently not on bookmarks page, waiting for navigation",
+        );
+      return false;
     }
     if (injectionObserver) injectionObserver.disconnect();
 
     console.log("[Label Bookmarks] Try Injecting");
 
-    const workInfo = await updateWorkInfo(true);
-    if (!workInfo["works"]) {
-      if (injectionObserver)
-        injectionObserver.observe(pageBody, { childList: true });
-      return console.log(
-        "[Label Bookmarks] Abort Injection due to no works detected yet",
-      );
+    // Mount the main toolbar buttons into the profile nav (or section header fallback) immediately
+    let root = findProfileNav();
+    if (!root) {
+      try {
+        root = await waitForDom(NAV, document, 15);
+      } catch (_) {
+        root = findProfileNav() || document.querySelector(WORK_SECTION);
+      }
     }
-    if (DEBUG) {
-      console.log("[Label Bookmarks] User Tags", userTags, userTagDict);
-      console.log("[Label Bookmarks] Dict:", synonymDict);
+    if (root) {
+      root.classList.add("d-flex");
+      if (!document.querySelector("#label_bookmarks_buttons")) {
+        root.appendChild(buttonContainer);
+      }
+    } else {
+      console.log("[Label Bookmarks] Navbar Not Found, using floating toolbar");
+      buttonContainer.style.cssText =
+        "position: fixed; top: 64px; right: 24px; z-index: 1030; background: inherit; padding: 4px 8px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.2);";
+      document.body.appendChild(buttonContainer);
     }
 
-    root.appendChild(buttonContainer);
     setElementProperties();
     setSynonymEventListener();
     setAdvancedSearch();
 
-    // show user-labeled tags
-    const ul = await waitForDom(WORK_CONTAINER);
-    async function updateAssociatedTagsCallback() {
-      const workInfo = await updateWorkInfo(true);
-      if (DEBUG) console.log("[Label Bookmarks] Page", workInfo.page, workInfo);
-      // TODO
-      [...ul.querySelectorAll("li")].forEach((li, i) => {
-        const pa = li.firstElementChild.firstElementChild;
-        if (showWorkTags) {
-          const tagsString = workInfo["works"][i].associatedTags
-            .map((i) => "#" + i)
-            .join(" ");
-          const tagDiv = document.createElement("div");
-          tagDiv.className = "my-1";
-          tagDiv.style.cssText =
-            "font-size: 10px; color: rgb(61, 118, 153); pointer-events: none";
-          tagDiv.innerHTML = tagsString;
-          pa.insertBefore(tagDiv, pa.children[1]);
-        }
-        if (workInfo["works"][i]["userName"] === "-----") {
-          const pidDiv = document.createElement("div");
-          pidDiv.className = "my-1";
-          pidDiv.style.cssText =
-            "font-size: 10px; color: rgb(61, 118, 153); pointer-events: none";
-          pidDiv.innerHTML = `PID: ${workInfo["works"][i].id}`;
-          pa.insertBefore(pidDiv, pa.children[1]);
-        }
-      });
+    const workInfo = await updateWorkInfo(true);
+    if (DEBUG) {
+      console.log("[Label Bookmarks] User Tags", userTags, userTagDict);
+      console.log("[Label Bookmarks] Dict:", synonymDict);
+      console.log("[Label Bookmarks] WorkInfo:", workInfo);
     }
-    await updateAssociatedTagsCallback();
-    new MutationObserver(updateAssociatedTagsCallback).observe(ul, {
-      childList: true,
-    });
 
-    const editButtonContainer = await waitForDom(EDIT_BUTTON_CONTAINER);
-    if (editButtonContainer) {
-      editButtonContainer.style.justifyContent = "initial";
-      editButtonContainer.firstElementChild.style.marginRight = "auto";
-      editButtonContainer.insertBefore(
-        removeTagButton,
-        editButtonContainer.lastChild,
+    // 1. Show user-labeled tags & invalid PID on cards
+    try {
+      const ul = await waitForDom(WORK_CONTAINER, document, 25);
+      async function updateAssociatedTagsCallback() {
+        const workInfo = await updateWorkInfo(true);
+        if (DEBUG)
+          console.log("[Label Bookmarks] Page", workInfo.page, workInfo);
+        if (!Array.isArray(workInfo["works"])) return;
+        [...ul.querySelectorAll("li")].forEach((li, i) => {
+          const work = workInfo["works"][i];
+          if (!work) return;
+          const pa =
+            li.firstElementChild?.firstElementChild || li.firstElementChild;
+          if (!pa) return;
+          pa.querySelectorAll(".lp-associated-tags, .lp-invalid-pid").forEach(
+            (n) => n.remove(),
+          );
+          if (showWorkTags && Array.isArray(work.associatedTags)) {
+            const tagsString = work.associatedTags
+              .map((t) => "#" + t)
+              .join(" ");
+            const tagDiv = document.createElement("div");
+            tagDiv.className = "my-1 lp-associated-tags";
+            tagDiv.style.cssText =
+              "font-size: 10px; color: rgb(61, 118, 153); pointer-events: none";
+            tagDiv.innerHTML = tagsString;
+            pa.insertBefore(tagDiv, pa.children[1] || null);
+          }
+          if (
+            work["userName"] === "-----" ||
+            work["title"] === "-----" ||
+            work["isMasked"] === true
+          ) {
+            const pidDiv = document.createElement("div");
+            pidDiv.className = "my-1 lp-invalid-pid";
+            pidDiv.style.cssText =
+              "font-size: 10px; color: rgb(61, 118, 153); pointer-events: none";
+            pidDiv.innerHTML = `ID: ${work.id}`;
+            pa.insertBefore(pidDiv, pa.children[1] || null);
+          }
+        });
+      }
+      await updateAssociatedTagsCallback();
+      new MutationObserver(updateAssociatedTagsCallback).observe(ul, {
+        childList: true,
+      });
+    } catch (err) {
+      if (DEBUG)
+        console.log("[Label Bookmarks] WORK_CONTAINER observer skipped:", err);
+    }
+
+    // 2. Edit Mode: Clear Tags & Delete Tag buttons
+    try {
+      const editButtonContainer = await waitForDom(
+        EDIT_BUTTON_CONTAINER,
+        document,
+        25,
       );
-      let removeBookmarkContainerObserver;
-      const editButtonObserver = new MutationObserver(
-        async (MutationRecord) => {
+      if (editButtonContainer) {
+        editButtonContainer.style.justifyContent = "initial";
+        editButtonContainer.style.alignItems = "center";
+        if (editButtonContainer.firstElementChild) {
+          editButtonContainer.firstElementChild.style.marginRight = "auto";
+        }
+        editButtonContainer.insertBefore(
+          removeTagButton,
+          editButtonContainer.lastChild,
+        );
+        let removeBookmarkContainerObserver;
+        const setClearBtnDisabled = (disabled) => {
+          const val = disabled ? "true" : "false";
+          clearTagsButton.setAttribute("aria-disabled", val);
+          clearTagsButton.children[0]?.setAttribute("aria-disabled", val);
+          clearTagsButton.style.opacity = disabled ? "0.35" : "1";
+          clearTagsButton.style.pointerEvents = disabled ? "none" : "auto";
+        };
+        const editButtonObserver = new MutationObserver(async () => {
           const { tag } = await updateWorkInfo();
-          if (!MutationRecord[0].addedNodes.length) {
-            // open edit mode
+          const section = document.querySelector(WORK_SECTION);
+          const isEditMode =
+            Boolean(section?.querySelector('input[type="checkbox"]')) ||
+            editButtonContainer.children.length <= 2;
+          if (isEditMode) {
             const removeBookmarkContainer = document.querySelector(
               REMOVE_BOOKMARK_CONTAINER,
             );
-            removeBookmarkContainer.appendChild(clearTagsButton);
-            removeBookmarkContainerObserver = new MutationObserver(() => {
-              const value =
-                removeBookmarkContainer.children[2].getAttribute(
-                  "aria-disabled",
-                );
-              clearTagsButton.setAttribute("aria-disabled", value);
-              clearTagsButton.children[0].setAttribute("aria-disabled", value);
-            });
-            removeBookmarkContainerObserver.observe(
-              removeBookmarkContainer.children[2],
-              { attributes: true },
-            );
+            if (
+              removeBookmarkContainer &&
+              !removeBookmarkContainer.contains(clearTagsButton)
+            ) {
+              removeBookmarkContainer.appendChild(clearTagsButton);
+              const syncDisabled = () => {
+                const nativeBtns = [
+                  ...removeBookmarkContainer.querySelectorAll(
+                    '[role="button"][aria-disabled]',
+                  ),
+                ].filter((el) => !clearTagsButton.contains(el));
+                const nativeBtn = nativeBtns[nativeBtns.length - 1];
+                const isDisabled = nativeBtn
+                  ? nativeBtn.getAttribute("aria-disabled") === "true"
+                  : true;
+                setClearBtnDisabled(isDisabled);
+              };
+              syncDisabled();
+              removeBookmarkContainerObserver = new MutationObserver(
+                syncDisabled,
+              );
+              removeBookmarkContainerObserver.observe(removeBookmarkContainer, {
+                subtree: true,
+                attributes: true,
+                attributeFilter: ["aria-disabled"],
+              });
+            }
             if (tag && tag !== "未分類") {
-              document.querySelector("#remove_tag_prompt").innerText =
-                lang.includes("zh") ? "删除标签 " + tag : "Delete Tag " + tag;
-              removeTagButton.style.display = "flex";
+              const promptEl = document.querySelector("#remove_tag_prompt");
+              if (promptEl) {
+                promptEl.innerText = lang.includes("zh")
+                  ? "删除标签 " + tag
+                  : "Delete Tag " + tag;
+              }
+              removeTagButton.style.display = "inline-flex";
             }
           } else {
-            // exit edit mode
             removeTagButton.style.display = "none";
             if (removeBookmarkContainerObserver)
               removeBookmarkContainerObserver.disconnect();
-            clearTagsButton.setAttribute("aria-disabled", "true");
-            clearTagsButton.children[0].setAttribute("aria-disabled", "true");
+            setClearBtnDisabled(true);
           }
-        },
-      );
-      editButtonObserver.observe(editButtonContainer, {
-        childList: true,
-      });
-    }
-
-    let lastTag = workInfo.tag;
-    const tagsContainer = await waitForDom(ALL_TAGS_CONTAINER);
-    new MutationObserver(async () => {
-      const workInfo = await updateWorkInfo();
-      if (lastTag !== workInfo.tag) {
-        lastTag = workInfo.tag;
-        const removeTagButton = document.querySelector("#remove_tag_button");
-        if (!workInfo.tag || workInfo.tag === "未分類") {
-          if (removeTagButton && removeTagButton.style.display === "flex") {
-            removeTagButton.style.display = "none";
-          }
-        } else {
-          if (
-            workInfo["editMode"] &&
-            removeTagButton &&
-            removeTagButton.style.display === "none"
-          ) {
-            removeTagButton.style.display = "flex";
-          }
-          const removeTagButtonPrompt =
-            document.querySelector("#remove_tag_prompt");
-          if (removeTagButtonPrompt)
-            removeTagButtonPrompt.innerText = lang.includes("zh")
-              ? "删除标签 " + workInfo.tag
-              : "Delete Tag " + workInfo.tag;
-        }
+        });
+        editButtonObserver.observe(editButtonContainer, {
+          childList: true,
+          subtree: true,
+        });
       }
+    } catch (err) {
       if (DEBUG)
         console.log(
-          "[Label Bookmarks] Current Tag",
-          workInfo.tag || "Uncategorized",
+          "[Label Bookmarks] EDIT_BUTTON_CONTAINER observer skipped:",
+          err,
         );
-    }).observe(tagsContainer, {
-      subtree: true,
-      childList: true,
-    });
+    }
 
+    // 3. Tag bar change observer
+    try {
+      let lastTag = workInfo.tag;
+      const tagsContainer = await waitForDom(ALL_TAGS_CONTAINER, document, 25);
+      new MutationObserver(async () => {
+        const workInfo = await updateWorkInfo();
+        if (lastTag !== workInfo.tag) {
+          lastTag = workInfo.tag;
+          const removeTagButton = document.querySelector("#remove_tag_button");
+          if (!workInfo.tag || workInfo.tag === "未分類") {
+            if (
+              removeTagButton &&
+              removeTagButton.style.display !== "none"
+            ) {
+              removeTagButton.style.display = "none";
+            }
+          } else {
+            if (
+              workInfo["editMode"] &&
+              removeTagButton &&
+              removeTagButton.style.display === "none"
+            ) {
+              removeTagButton.style.display = "inline-flex";
+            }
+            const removeTagButtonPrompt =
+              document.querySelector("#remove_tag_prompt");
+            if (removeTagButtonPrompt)
+              removeTagButtonPrompt.innerText = lang.includes("zh")
+                ? "删除标签 " + workInfo.tag
+                : "Delete Tag " + workInfo.tag;
+          }
+        }
+        if (DEBUG)
+          console.log(
+            "[Label Bookmarks] Current Tag",
+            workInfo.tag || "Uncategorized",
+          );
+      }).observe(tagsContainer, {
+        subtree: true,
+        childList: true,
+      });
+    } catch (err) {
+      if (DEBUG)
+        console.log(
+          "[Label Bookmarks] ALL_TAGS_CONTAINER observer skipped:",
+          err,
+        );
+    }
+
+    // 4. Click work count badge to jump to Uncategorized works of current workType
     const toUncategorized = document.querySelector(WORK_NUM);
     if (toUncategorized) {
       toUncategorized.style.cursor = "pointer";
-      toUncategorized.onclick = () =>
-        (window.location.href = `https://www.pixiv.net/users/${uid}/bookmarks/artworks/未分類`);
+      toUncategorized.onclick = () => {
+        const st = getBookmarkPageState();
+        window.location.href = getBookmarksPageUrl(
+          uid,
+          workType,
+          "未分類",
+          st.publicationType,
+        );
+      };
     }
 
+    // 5. Optional custom tag selection dialog
     const tagSelectionDialog =
       getValue("tagSelectionDialog", "false") === "true";
     if (tagSelectionDialog) {
-      // sort tags in popup
-      new MutationObserver((MutationRecord) => {
-        if (MutationRecord[0].addedNodes[0]) {
-          const root = MutationRecord[0].addedNodes[0];
-          const ul = root.querySelector("ul");
-          if (ul) {
-            [...ul.children]
-              .sort((a, b) => {
-                let iA = userTags.indexOf(a.textContent.slice(1));
-                let iB = userTags.indexOf(b.textContent.slice(1));
-                if (a.querySelector(ADD_TAGS_MODAL_ENTRY)) iA = -1;
-                if (b.querySelector(ADD_TAGS_MODAL_ENTRY)) iB = -1;
-                return iA - iB;
-              })
-              .forEach((node) => ul.appendChild(node));
+      try {
+        new MutationObserver((MutationRecord) => {
+          if (MutationRecord[0]?.addedNodes[0]) {
+            const root = MutationRecord[0].addedNodes[0];
+            if (!root.querySelector) return;
+            const ul = root.querySelector("ul");
+            if (ul) {
+              [...ul.children]
+                .sort((a, b) => {
+                  let iA = userTags.indexOf(a.textContent.slice(1));
+                  let iB = userTags.indexOf(b.textContent.slice(1));
+                  if (a.querySelector(ADD_TAGS_MODAL_ENTRY)) iA = -1;
+                  if (b.querySelector(ADD_TAGS_MODAL_ENTRY)) iB = -1;
+                  return iA - iB;
+                })
+                .forEach((node) => ul.appendChild(node));
+            }
           }
-        }
-      }).observe(document.body, {
-        childList: true,
-        subtree: false,
-        attributes: false,
-      });
-
-      // all tags selection control
-      const prevAllTagsButton = await waitForDom(ALL_TAGS_BUTTON);
-      prevAllTagsButton.style.display = "none";
-      addStyle(".ggMyQW { z-index: -1; }");
-      const allTagsButton = document.createElement("div");
-      allTagsButton.setAttribute("data-bs-toggle", "modal");
-      allTagsButton.setAttribute("data-bs-target", "#all_tags_modal");
-      allTagsButton.classList.add(ALL_TAGS_BUTTON.slice(1));
-      allTagsButton.role = "button";
-      allTagsButton.innerHTML = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-asterisk" viewBox="0 0 16 16">
-      <path d="M8 0a1 1 0 0 1 1 1v5.268l4.562-2.634a1 1 0 1 1 1 1.732L10 8l4.562 2.634a1 1 0 1 1-1 1.732L9 9.732V15a1 1 0 1 1-2 0V9.732l-4.562 2.634a1 1 0 1 1-1-1.732L6 8 1.438 5.366a1 1 0 0 1 1-1.732L7 6.268V1a1 1 0 0 1 1-1z"/>
-    </svg>`;
-      const allTagsContainer = await waitForDom(ALL_TAGS_CONTAINER);
-      allTagsContainer.appendChild(allTagsButton);
-      allTagsButton.addEventListener("click", () => {
-        document.querySelector(ALL_TAGS_BUTTON)?.click();
-        const modal = document.querySelector("#all_tags_modal");
-        modal.addEventListener("shown.bs.modal", () => modal.focus());
-        modal.addEventListener("hidden.bs.modal", () => {
-          document
-            .querySelector(ALL_TAGS_MODAL)
-            ?.querySelector("button")
-            .click();
+        }).observe(document.body, {
+          childList: true,
+          subtree: false,
+          attributes: false,
         });
-      });
+
+        const prevAllTagsButton = await waitForDom(
+          ALL_TAGS_BUTTON,
+          document,
+          15,
+        );
+        prevAllTagsButton.style.display = "none";
+        addStyle(".ggMyQW { z-index: -1; }");
+        const allTagsButton = document.createElement("div");
+        allTagsButton.setAttribute("data-bs-toggle", "modal");
+        allTagsButton.setAttribute("data-bs-target", "#all_tags_modal");
+        allTagsButton.role = "button";
+        allTagsButton.style.cssText = "cursor: pointer; padding: 4px 8px;";
+        allTagsButton.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-asterisk" viewBox="0 0 16 16">
+        <path d="M8 0a1 1 0 0 1 1 1v5.268l4.562-2.634a1 1 0 1 1 1 1.732L10 8l4.562 2.634a1 1 0 1 1-1 1.732L9 9.732V15a1 1 0 1 1-2 0V9.732l-4.562 2.634a1 1 0 1 1-1-1.732L6 8 1.438 5.366a1 1 0 0 1 1-1.732L7 6.268V1a1 1 0 0 1 1-1z"/>
+      </svg>`;
+        const allTagsContainer = await waitForDom(
+          ALL_TAGS_CONTAINER,
+          document,
+          15,
+        );
+        allTagsContainer.appendChild(allTagsButton);
+      } catch (err) {
+        if (DEBUG)
+          console.log("[Label Bookmarks] tagSelectionDialog skipped:", err);
+      }
     }
 
     console.log("[Label Bookmarks] Injected");
-
-    window.addEventListener(
-      "popstate",
-      () => {
-        if (window.location.href.match(/\/users\/\d+\/bookmarks\/artworks/))
-          delay(1000)
-            .then(() => waitForDom(ALL_TAGS_CONTAINER))
-            .then(createModalElements)
-            .then(injectElements);
-      },
-      { once: true },
-    );
-
     return true;
   }
 
   if (!(await injection())) {
-    console.log("[Label Bookmarks] Injecting Failed on the first try");
+    console.log("[Label Bookmarks] Waiting for bookmarks page DOM...");
     const pageObserver = new MutationObserver(injection);
-    pageObserver.observe(pageBody, { childList: true });
+    pageObserver.observe(pageBody, { childList: true, subtree: true });
   }
 }
 
@@ -3455,16 +4361,17 @@ async function updateSuggestion(
   }, 500);
 }
 
-function setElementProperties() {
-  // label buttons
+function updateNavbarButtonLabels() {
   const labelButton = document.querySelector("#label_modal_button");
   const searchButton = document.querySelector("#search_modal_button");
   const generatorButton = document.querySelector("#generator_modal_button");
   const featureButton = document.querySelector("#feature_modal_button");
-  if (lang.includes("zh")) {
+  if (!labelButton) return;
+  if (lang && lang.includes("zh")) {
+    const noun = workType === "novels" ? "小说" : "图片";
     labelButton.innerText = "添加标签";
-    searchButton.innerText = "搜索图片";
-    generatorButton.innerText = "随机图片";
+    searchButton.innerText = `搜索${noun}`;
+    generatorButton.innerText = `随机${noun}`;
     featureButton.innerText = "其他功能";
   } else {
     labelButton.innerText = "Label";
@@ -3472,6 +4379,61 @@ function setElementProperties() {
     generatorButton.innerText = "Shuffle";
     featureButton.innerText = "Function";
   }
+}
+
+function populateUserTagSelects() {
+  const customSelects = [...document.querySelectorAll(".select-custom-tags")];
+  customSelects.forEach((el) => {
+    const prevValue = el.value;
+    // Remove previously appended dynamic user tag options (keep "" and "未分類")
+    [...el.querySelectorAll("option")].forEach((opt) => {
+      if (opt.value !== "" && opt.value !== "未分類") {
+        opt.remove();
+      }
+    });
+    const uncat = el.querySelector("option[value='未分類']");
+    if (uncat) {
+      const t = "未分類";
+      const pb =
+        (userTagDict?.public || []).find((e) => e.tag === t)?.["cnt"] || 0;
+      const pr =
+        (userTagDict?.["private"] || []).find((e) => e.tag === t)?.["cnt"] || 0;
+      uncat.innerText = `未分类作品 / Uncategorized Works (${pb}, ${pr})`;
+    }
+    (userTags || []).forEach((tag) => {
+      const option = document.createElement("option");
+      option.value = tag;
+      const pb =
+        (userTagDict?.public || []).find((e) => e.tag === tag)?.["cnt"] || 0;
+      const pr =
+        (userTagDict?.["private"] || []).find((e) => e.tag === tag)?.["cnt"] ||
+        0;
+      option.innerText = tag + ` (${pb}, ${pr})`;
+      el.appendChild(option);
+    });
+    if (
+      prevValue &&
+      (prevValue === "未分類" || (userTags || []).includes(prevValue))
+    ) {
+      el.value = prevValue;
+    }
+  });
+  renderAllTagsModalContent();
+}
+
+async function switchWorkType(newWorkType) {
+  if (newWorkType !== "illusts" && newWorkType !== "novels") return;
+  workType = newWorkType;
+  [...document.querySelectorAll(".work-type-select")].forEach((sel) => {
+    sel.value = workType;
+  });
+  updateNavbarButtonLabels();
+  userTags = await fetchUserTags(workType);
+  populateUserTagSelects();
+}
+
+function setElementProperties() {
+  updateNavbarButtonLabels();
   addStyle(
     `.label-button {
          padding: 0 24px;
@@ -3491,26 +4453,26 @@ function setElementProperties() {
        }`,
   );
 
-  // append user tags options
-  const customSelects = [...document.querySelectorAll(".select-custom-tags")];
-  customSelects.forEach((el) => {
-    const uncat = el.querySelector("option[value='未分類']");
-    if (uncat) {
-      const t = "未分類";
-      const pb = userTagDict.public.find((e) => e.tag === t)?.["cnt"] || 0;
-      const pr = userTagDict["private"].find((e) => e.tag === t)?.["cnt"] || 0;
-      uncat.innerText = `未分类作品 / Uncategorized Works (${pb}, ${pr})`;
-    }
-    userTags.forEach((tag) => {
-      const option = document.createElement("option");
-      option.value = tag;
-      const pb = userTagDict.public.find((e) => e.tag === tag)?.["cnt"] || 0;
-      const pr =
-        userTagDict["private"].find((e) => e.tag === tag)?.["cnt"] || 0;
-      option.innerText = tag + ` (${pb}, ${pr})`;
-      el.appendChild(option);
-    });
+  // Sync workType selects & wire change listeners
+  [...document.querySelectorAll(".work-type-select")].forEach((sel) => {
+    sel.value = workType;
+    sel.onchange = (evt) => switchWorkType(evt.target.value);
   });
+
+  // Sync publicationType selects with current URL state
+  const currentPubType = getBookmarkPageState().publicationType;
+  [
+    "#label_publication",
+    "#search_publication",
+    "#generator_form_publication",
+    "#feature_form_publication",
+  ].forEach((selId) => {
+    const el = document.querySelector(selId);
+    if (el && currentPubType) el.value = currentPubType;
+  });
+
+  // append user tags options
+  populateUserTagSelects();
 
   // label bookmark form
   const labelForm = document.querySelector("#label_form");
@@ -3532,7 +4494,7 @@ function setElementProperties() {
 
   const tagToQuery = document.querySelector("#label_tag_query");
   const tag = getValue("tagToQuery", "未分類");
-  if (userTags.includes(tag)) tagToQuery.value = tag;
+  if (userTags.includes(tag) || tag === "") tagToQuery.value = tag;
   // in case that tag has been deleted
   else tagToQuery.value = "未分類";
   tagToQuery.onchange = () => setValue("tagToQuery", tagToQuery.value);
@@ -3561,6 +4523,13 @@ function setElementProperties() {
   labelStrict.value = getValue("labelStrict", "true");
   labelStrict.onchange = () => setValue("labelStrict", labelStrict.value);
 
+  const labelShareTags = document.querySelector("#label_share_tags");
+  if (labelShareTags) {
+    labelShareTags.value = getValue("labelShareTags", "true");
+    labelShareTags.onchange = () =>
+      setValue("labelShareTags", labelShareTags.value);
+  }
+
   // search bookmark form
   const searchForm = document.querySelector("#search_form");
   searchForm.onsubmit = handleSearch;
@@ -3578,7 +4547,10 @@ function setElementProperties() {
   if (DEBUG) console.log("[Label Bookmarks] Element Properties Set");
 }
 
+let synonymEventListenerInitialized = false;
 function setSynonymEventListener() {
+  if (synonymEventListenerInitialized) return;
+  synonymEventListenerInitialized = true;
   const targetTag = document.querySelector("#target_tag");
   const alias = document.querySelector("#tag_alias");
   const preview = document.querySelector("#synonym_preview");
@@ -3637,8 +4609,7 @@ function setSynonymEventListener() {
       const reader = new FileReader();
       reader.onload = (evt) => {
         try {
-          let json = {};
-          eval("json = " + evt.target.result.toString());
+          let json = JSON.parse(evt.target.result.toString());
           if (Array.isArray(json)) synonymDict = json[0];
           else synonymDict = json;
           setValue("synonymDict", synonymDict);
@@ -3769,6 +4740,11 @@ function setSynonymEventListener() {
 }
 
 function setAdvancedSearch() {
+  const basic = document.querySelector("#basic_search_field");
+  const advanced = document.querySelector("#advanced_search_fields");
+  if (!basic || !advanced) return;
+  if (basic.childElementCount || advanced.childElementCount) return;
+
   function generatePlaceholder() {
     const synonymDictKeys = Object.keys(synonymDict);
     return synonymDictKeys.length
@@ -3898,8 +4874,6 @@ function setAdvancedSearch() {
     fieldContainer.appendChild(configContainer);
     return fieldContainer;
   }
-  const basic = document.querySelector("#basic_search_field");
-  const advanced = document.querySelector("#advanced_search_fields");
   basic.appendChild(generateBasicField());
   if (DEBUG) console.log("[Label Bookmarks] Advanced Search Set");
 }
@@ -3918,12 +4892,12 @@ function registerMenu() {
     });
   generator = getValue("showGenerator", "false") === "true";
   if (generator)
-    GM_registerMenuCommand_("关闭随机图片 / Disable Shuffled Images", () => {
+    GM_registerMenuCommand_("关闭随机作品 / Disable Shuffled Works", () => {
       setValue("showGenerator", "false");
       window.location.reload();
     });
   else
-    GM_registerMenuCommand_("启用随机图片 / Enable Shuffled Images", () => {
+    GM_registerMenuCommand_("启用随机作品 / Enable Shuffled Works", () => {
       setValue("showGenerator", "true");
       window.location.reload();
     });
@@ -3958,12 +4932,73 @@ function registerMenu() {
   turboMode = getValue("turboMode", "false") === "true";
 }
 
+let isBootstrapping = false;
+async function bootstrapPlugin() {
+  if (isBootstrapping) return;
+  isBootstrapping = true;
+  try {
+    await waitForDom("nav", document, 40).catch(() => null);
+    await initializeVariables();
+    if (!document.querySelector("#label_modal")) {
+      createModalElements();
+    }
+    await injectElements();
+  } catch (err) {
+    console.log("[Label Bookmarks] Bootstrap error:", err);
+  } finally {
+    isBootstrapping = false;
+  }
+}
+
+function setupSpaNavigationWatcher() {
+  let lastUrl = window.location.href;
+  let navDebounce = null;
+  const onUrlChange = () => {
+    const currentUrl = window.location.href;
+    const buttonsMissing = !document.querySelector("#label_bookmarks_buttons");
+    const isBmPage = /\/users\/\d+\/bookmarks\/(artworks|novels)/.test(
+      currentUrl,
+    );
+    if (currentUrl === lastUrl && !buttonsMissing) return;
+    const prevWorkType = workType;
+    const nextWorkType = detectWorkTypeFromUrl(currentUrl);
+    const urlChanged = currentUrl !== lastUrl;
+    lastUrl = currentUrl;
+    if (!isBmPage) return;
+    if (urlChanged || buttonsMissing || prevWorkType !== nextWorkType) {
+      clearTimeout(navDebounce);
+      navDebounce = setTimeout(async () => {
+        if (prevWorkType !== nextWorkType) {
+          await switchWorkType(nextWorkType);
+        }
+        await bootstrapPlugin();
+      }, 500);
+    }
+  };
+
+  [window, unsafeWindow_].forEach((win) => {
+    if (!win || !win.history) return;
+    ["pushState", "replaceState"].forEach((method) => {
+      const orig = win.history[method];
+      if (typeof orig === "function" && !orig._lpPatched) {
+        const patched = function (...args) {
+          const ret = orig.apply(this, args);
+          onUrlChange();
+          return ret;
+        };
+        patched._lpPatched = true;
+        win.history[method] = patched;
+      }
+    });
+  });
+  window.addEventListener("popstate", onUrlChange);
+  setInterval(onUrlChange, 1200);
+}
+
 (function () {
   "use strict";
   loadResources();
   registerMenu();
-  waitForDom("nav")
-    .then(initializeVariables)
-    .then(createModalElements)
-    .then(injectElements);
+  setupSpaNavigationWatcher();
+  bootstrapPlugin();
 })();

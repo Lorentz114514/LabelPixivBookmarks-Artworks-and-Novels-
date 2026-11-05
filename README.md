@@ -1,8 +1,17 @@
-# Label Pixiv Bookmarks
+# Label Pixiv Bookmarks (Artworks & Novels)
 
 <a href="#cn_doc">中文文档</a>
 
-## Automatically add existing tags for images in the bookmarks, and search them
+## Automatically add existing tags for Artworks (Illustrations/Manga) and Novels in Pixiv bookmarks, and search them
+
+### 🚀 One-Click Install (Tampermonkey)
+- **[Click here to install `index.js` via Tampermonkey](https://raw.githubusercontent.com/Lorentz114514/LabelPixivBookmarks/HEAD/index.js)**
+
+### ✨ Fork Highlights ([Lorentz114514/LabelPixivBookmarks](https://github.com/Lorentz114514/LabelPixivBookmarks))
+1. **Restored Functionality for New Pixiv UI**: Replaced hardcoded hashed CSS classes with semantic selectors, URL state parsing, and multi-layer React Fiber + Pixiv AJAX API fallbacks.
+2. **Full Support for Novel Bookmarks (`小说 / Novels`)**:
+   - Auto-labeling, bookmark search, random work generator, tag management, invalid work cleanup, and backup/import now work seamlessly on both `/bookmarks/artworks` and `/bookmarks/novels`.
+   - Supports **cross-category tag sharing** (match existing Artwork bookmark tags when labeling Novels and vice versa).
 
 ## Please Use Tampermonkey as the script manager
 
@@ -229,7 +238,19 @@ Please report bugs or new features expected at [GitHub](https://github.com/Ziqin
 
 
 
-<h1 id="cn_doc">自动为Pixiv收藏夹内图片打上已有的标签</h1>
+<h1 id="cn_doc">自动为Pixiv收藏夹内插画、漫画与小说打上标签</h1>
+
+## 🚀 一键安装脚本
+
+- **篡改猴（Tampermonkey）一键安装链接**：**[点击此处直接安装 `index.js`](https://raw.githubusercontent.com/Lorentz114514/LabelPixivBookmarks/HEAD/index.js)**
+
+## ✨ 本仓库（[Lorentz114514/LabelPixivBookmarks](https://github.com/Lorentz114514/LabelPixivBookmarks)）更新内容
+
+1. **全面修复新版 Pixiv UI 失效问题**：移除旧版写死的哈希 CSS 类名，改用语义化 DOM 选择器、URL 状态解析以及「React Fiber 树深度提取 + Pixiv Web AJAX API」双保险机制，支持 SPA 页面无缝切换。
+2. **新增对收藏夹【小说（Novels）】的完整支持**：
+   - 在 `/users/<uid>/bookmarks/novels` 小说收藏夹页面同样注入顶部功能按钮，并在所有弹窗中支持随时切换 `插画・漫画 / Artworks` 与 `小说 / Novels`。
+   - 支持**跨分类共享标签**（默认开启：给小说自动打标签时可同时匹配插画收藏夹中已有的标签，反之亦然）。
+   - 搜索收藏、随机作品、失效作品清理、收藏夹备份与导入、页面内直接展示已标记标签等功能均已完整适配小说卡片。
 
 ## 请使用Tampermonkey插件
 
