@@ -1087,6 +1087,46 @@ All tags that come with the work will be first added to your user tags, which ca
     ]),
   );
 
+  // Pre-index userTags and synonymDict into O(1) lookup maps to avoid O(N*M) repeated string/array scans
+  const fullTagIndex = new Map();
+  const charTagIndex = new Map();
+  const aliasReplaceIndex = new Map();
+
+  function indexTargetTag(userTag, isSynonymKey = false) {
+    const candidates = [userTag, ...(synonymDict[userTag] || [])];
+    if (isSynonymKey && Array.isArray(synonymDict[userTag])) {
+      for (const alias of synonymDict[userTag]) {
+        if (alias && !aliasReplaceIndex.has(alias)) {
+          aliasReplaceIndex.set(alias, userTag);
+        }
+      }
+    }
+    for (const cand of candidates) {
+      if (cand === undefined || cand === null) continue;
+      const cStr = String(cand);
+      const cFull = cStr.toUpperCase();
+      if (!cFull) continue;
+      if (!fullTagIndex.has(cFull)) fullTagIndex.set(cFull, new Set());
+      fullTagIndex.get(cFull).add(userTag);
+
+      const cChar = getCharacterName(cStr).toUpperCase();
+      const cTitle = getWorkTitle(cStr).toUpperCase();
+      if (cChar) {
+        if (!charTagIndex.has(cChar)) charTagIndex.set(cChar, []);
+        charTagIndex.get(cChar).push({ userTag, cTitle });
+      }
+    }
+  }
+
+  for (const ut of effectiveUserTags) indexTargetTag(ut, false);
+  for (const sk of Object.keys(synonymDict)) {
+    if (!synonymDict[sk]) {
+      console.log(sk, synonymDict[sk]);
+      throw new Error("Empty value in synonym dictionary");
+    }
+    indexTargetTag(sk, true);
+  }
+
   // fetch bookmarks
   let total, // total bookmarks of specific tag
     index = 0, // counter of do-while loop
@@ -1104,7 +1144,7 @@ All tags that come with the work will be first added to your user tags, which ca
         clearInterval(intervalId);
       }
     }
-  }, 1000);
+  }, 500);
   do {
     const realOffset = tagToQuery === "未分類" ? offset : index;
     const bookmarks = await fetchBookmarks(
@@ -1120,6 +1160,9 @@ All tags that come with the work will be first added to your user tags, which ca
     if (total === undefined) total = bookmarks.total;
     const worksList = bookmarks["works"] || [];
     if (!worksList.length) break;
+
+    const pendingUpdates = [];
+
     for (let work of worksList) {
       const url = getWorkUrl(work, targetWorkType, true);
       if (DEBUG) console.log(index, work.title, work.id, url);
@@ -1130,79 +1173,65 @@ All tags that come with the work will be first added to your user tags, which ca
         continue;
       }
       const workTags = Array.isArray(work["tags"]) ? [...work["tags"]] : [];
-      let intersection = [];
+      const matchedSet = new Set();
       // add all work tags, and replace those which are defined in synonym dict
-      if (addAllTags === "true")
-        intersection = workTags.map(
-          (workTag) =>
-            Object.keys(synonymDict).find((userTag) =>
-              synonymDict[userTag].includes(workTag),
-            ) || workTag,
-        );
+      if (addAllTags === "true") {
+        for (const workTag of workTags) {
+          matchedSet.add(aliasReplaceIndex.get(workTag) || workTag);
+        }
+      }
       if (labelAuthor === "true") {
         if (work["userName"]) workTags.push(String(work["userName"]));
         if (work["userId"] !== undefined && work["userId"] !== null)
           workTags.push(String(work["userId"]));
       }
-      intersection = intersection.concat(
-        [...effectiveUserTags, ...Object.keys(synonymDict)].filter(
-          (userTag) => {
-            // if work tags includes this user tag
-            if (
-              arrayIncludes(workTags, userTag) || // full tag
-              arrayIncludes(workTags, userTag, getWorkTitle) || // work title
-              (arrayIncludes(workTags, userTag, null, getCharacterName) && // char name
-                (!labelStrict ||
-                  arrayIncludes(workTags, userTag, null, getWorkTitle))) // not strict or includes work title
-            )
-              return true;
-            // if work tags match a user alias (exact match)
-            return (
-              synonymDict[userTag] &&
-              synonymDict[userTag].find(
-                (alias) =>
-                  arrayIncludes(workTags, alias) ||
-                  arrayIncludes(workTags, alias, getWorkTitle) || // work title
-                  (arrayIncludes(workTags, alias, null, getCharacterName) &&
-                    (!labelStrict ||
-                      arrayIncludes(workTags, alias, null, getWorkTitle))),
-              )
-            );
-          },
-        ),
-      );
-      // if workTags match some alias, add it to the intersection (exact match, with or without work title)
-      intersection = intersection.concat(
-        Object.keys(synonymDict).filter((aliasName) => {
-          if (!synonymDict[aliasName]) {
-            console.log(aliasName, synonymDict[aliasName]);
-            throw new Error("Empty value in synonym dictionary");
+
+      const wFulls = workTags
+        .filter((t) => t !== undefined && t !== null)
+        .map((t) => String(t).toUpperCase())
+        .filter(Boolean);
+      const wFullSet = new Set(wFulls);
+      const wTitles = workTags
+        .map(getWorkTitle)
+        .filter(Boolean)
+        .map((t) => t.toUpperCase());
+      const wChars = workTags
+        .map(getCharacterName)
+        .filter(Boolean)
+        .map((t) => t.toUpperCase());
+
+      for (const wFull of wFulls) {
+        const directMatches = fullTagIndex.get(wFull);
+        if (directMatches) {
+          for (const ut of directMatches) matchedSet.add(ut);
+        }
+        const charMatches = charTagIndex.get(wFull);
+        if (charMatches) {
+          for (const { userTag: ut, cTitle } of charMatches) {
+            if (!labelStrict || (cTitle && wFullSet.has(cTitle))) {
+              matchedSet.add(ut);
+            }
           }
-          if (
-            workTags.some(
-              (workTag) =>
-                arrayIncludes(
-                  synonymDict[aliasName].concat(aliasName),
-                  workTag,
-                  null,
-                  getWorkTitle,
-                ) ||
-                arrayIncludes(
-                  synonymDict[aliasName].concat(aliasName),
-                  workTag,
-                  null,
-                  getCharacterName,
-                ),
-            )
-          )
-            return true;
-        }),
-      );
-      if (work["xRestrict"] && labelR18 === "true") intersection.push("R-18");
-      if (!work["xRestrict"] && labelSafe === "true") intersection.push("SFW");
-      if (work["aiType"] === 2 && labelAI === "true") intersection.push("AI");
+        }
+      }
+      for (const wTitle of wTitles) {
+        const titleMatches = fullTagIndex.get(wTitle);
+        if (titleMatches) {
+          for (const ut of titleMatches) matchedSet.add(ut);
+        }
+      }
+      for (const wChar of wChars) {
+        const charNameMatches = fullTagIndex.get(wChar);
+        if (charNameMatches) {
+          for (const ut of charNameMatches) matchedSet.add(ut);
+        }
+      }
+
+      if (work["xRestrict"] && labelR18 === "true") matchedSet.add("R-18");
+      if (!work["xRestrict"] && labelSafe === "true") matchedSet.add("SFW");
+      if (work["aiType"] === 2 && labelAI === "true") matchedSet.add("AI");
       // remove duplicate and exclusion
-      intersection = Array.from(new Set(intersection)).filter(
+      let intersection = Array.from(matchedSet).filter(
         (t) => !exclusion.includes(t),
       );
 
@@ -1219,10 +1248,11 @@ All tags that come with the work will be first added to your user tags, which ca
                 !tag.includes("入り"),
             )
             .slice(0, 1); // Can be changed if you want to add more than 1 tag from the same work
-          if (first) {
+          if (first && first.length) {
             intersection.push(...first);
             userTags.push(...first);
             effectiveUserTags.push(...first);
+            for (const ft of first) indexTargetTag(ft, false);
           }
         }
       }
@@ -1238,22 +1268,69 @@ All tags that come with the work will be first added to your user tags, which ca
         console.log("\tprevTags:", prevTags);
         console.log("\tintersection:", intersection);
         console.log("\taddTags:", addTags);
-      } else continue;
+        pendingUpdates.push({ work, bookmarkId, addTags });
+      }
+    }
 
-      promptBottom.innerText = `处理中，请勿关闭窗口 / Processing. Please do not close the window.\n${getWorkAlt(work)}`;
-      await updateBookmarkTags(
-        [bookmarkId],
-        addTags,
-        undefined,
-        undefined,
-        targetWorkType,
-      );
+    if (pendingUpdates.length) {
+      // Strategy A: group works with the exact same addTags set
+      const comboMap = new Map();
+      // Strategy B: group works by single tag, then merge tags sharing the exact same bookmarkId list
+      const singleTagMap = new Map();
 
-      if (!window.runFlag) {
-        promptBottom.innerText =
-          "检测到停止信号，程序已停止运行\nStop signal detected. Program exits.";
-        index = total;
-        break;
+      for (const item of pendingUpdates) {
+        const sortedTags = [...item.addTags].sort();
+        const comboKey = sortedTags.join("\0");
+        if (!comboMap.has(comboKey)) {
+          comboMap.set(comboKey, { tags: sortedTags, ids: [], lastWork: item.work });
+        }
+        const cEntry = comboMap.get(comboKey);
+        cEntry.ids.push(item.bookmarkId);
+        cEntry.lastWork = item.work;
+
+        for (const t of sortedTags) {
+          if (!singleTagMap.has(t)) {
+            singleTagMap.set(t, { ids: [], lastWork: item.work });
+          }
+          const sEntry = singleTagMap.get(t);
+          sEntry.ids.push(item.bookmarkId);
+          sEntry.lastWork = item.work;
+        }
+      }
+
+      const mergedByIdsMap = new Map();
+      for (const [tag, sEntry] of singleTagMap.entries()) {
+        const idsKey = sEntry.ids.join(",");
+        if (!mergedByIdsMap.has(idsKey)) {
+          mergedByIdsMap.set(idsKey, {
+            tags: [],
+            ids: sEntry.ids,
+            lastWork: sEntry.lastWork,
+          });
+        }
+        mergedByIdsMap.get(idsKey).tags.push(tag);
+      }
+
+      const batchesA = Array.from(comboMap.values());
+      const batchesB = Array.from(mergedByIdsMap.values());
+      const chosenBatches =
+        batchesA.length <= batchesB.length ? batchesA : batchesB;
+
+      for (const batch of chosenBatches) {
+        if (!window.runFlag) {
+          promptBottom.innerText =
+            "检测到停止信号，程序已停止运行\nStop signal detected. Program exits.";
+          index = total;
+          break;
+        }
+        promptBottom.innerText = `处理中，请勿关闭窗口 / Processing. Please do not close the window.\n${getWorkAlt(batch.lastWork)} (${batch.ids.length} works -> #${batch.tags.join(" #")})`;
+        await updateBookmarkTags(
+          batch.ids,
+          batch.tags,
+          undefined,
+          undefined,
+          targetWorkType,
+        );
       }
     }
   } while (index < total);
